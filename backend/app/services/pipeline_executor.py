@@ -1,0 +1,1402 @@
+"""
+Pipeline Executor Service
+
+Executes preset steps dynamically for publish tasks:
+- Registers handlers for each tool_id
+- Passes context between steps
+- Tracks execution status and timing
+- Handles errors gracefully
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Awaitable
+
+import httpx
+
+logger = logging.getLogger("pipeline")
+
+
+class StepContext:
+    """Context passed between pipeline steps."""
+    
+    def __init__(
+        self,
+        task_id: int,
+        task_dir: Path,
+        log_cb: Callable[[str], None],
+    ):
+        self.task_id = task_id
+        self.task_dir = task_dir
+        self.log = log_cb
+        
+        # Input/output paths
+        self.raw_path = task_dir / "raw.mp4"
+        self.ready_path = task_dir / "ready.mp4"
+        self.final_path = task_dir / "final.mp4"
+        self.thumb_path = task_dir / "thumb.jpg"
+        self.preview_path = task_dir / "preview.mp4"
+        self.probe_path = task_dir / "probe.json"
+        self.captions_path = task_dir / "captions.srt"
+        
+        # Current working video (changes as steps process)
+        self.current_video: Path | None = None
+        
+        # Metadata
+        self.probe_data: dict = {}
+        self.caption_text: str | None = None
+        self.download_url: str | None = None
+        self.permalink: str | None = None
+        
+        # Step outputs accumulator
+        self.outputs: dict[str, Any] = {}
+    
+    def get_input_video(self) -> Path:
+        """Get current input video for next step."""
+        return self.current_video or self.raw_path
+    
+    def set_output_video(self, path: Path):
+        """Set output video as input for next step."""
+        self.current_video = path
+
+
+StepHandler = Callable[[StepContext, dict], Awaitable[dict]]
+
+
+class PipelineExecutor:
+    """Executes pipeline steps for video processing."""
+    
+    _handlers: dict[str, StepHandler] = {}
+    
+    @classmethod
+    def register(cls, tool_id: str):
+        """Decorator to register a step handler."""
+        def decorator(func: StepHandler) -> StepHandler:
+            cls._handlers[tool_id] = func
+            return func
+        return decorator
+    
+    @classmethod
+    def get_handler(cls, tool_id: str) -> StepHandler | None:
+        """Get handler for a tool_id."""
+        return cls._handlers.get(tool_id)
+    
+    @classmethod
+    def list_handlers(cls) -> list[str]:
+        """List all registered handlers."""
+        return list(cls._handlers.keys())
+    
+    def __init__(self, context: StepContext):
+        self.context = context
+        self.steps_debug: list[dict] = []
+    
+    async def execute_steps(self, steps: list[dict]) -> dict:
+        """
+        Execute a list of preset steps.
+        
+        Args:
+            steps: List of step dicts with tool_id, params, enabled, etc.
+        
+        Returns:
+            Dict with execution results
+        """
+        results = {
+            "success": True,
+            "steps_executed": 0,
+            "steps_skipped": 0,
+            "steps_failed": 0,
+            "error": None,
+            "steps": [],
+        }
+        
+        for step in steps:
+            step_id = step.get("id")
+            tool_id = step.get("tool_id")
+            enabled = step.get("enabled", True)
+            params = step.get("params", {})
+            name = step.get("name", tool_id)
+            
+            step_result = {
+                "id": step_id,
+                "tool_id": tool_id,
+                "name": name,
+                "status": "pending",
+                "started_at": None,
+                "finished_at": None,
+                "duration_ms": None,
+                "outputs": {},
+                "error": None,
+            }
+            self.steps_debug.append(step_result)
+            
+            if not enabled:
+                step_result["status"] = "skipped"
+                results["steps_skipped"] += 1
+                results["steps"].append(step_result)
+                continue
+            
+            handler = self.get_handler(tool_id)
+            if not handler:
+                self.context.log(f"[{tool_id}] No handler registered, skipping")
+                step_result["status"] = "skipped"
+                step_result["error"] = "No handler registered"
+                results["steps_skipped"] += 1
+                results["steps"].append(step_result)
+                continue
+            
+            # Execute step
+            step_result["status"] = "processing"
+            step_result["started_at"] = datetime.now(timezone.utc).isoformat()
+            t_start = datetime.now(timezone.utc)
+            
+            try:
+                self.context.log(f"[{tool_id}] Starting step: {name}")
+                outputs = await handler(self.context, params)
+                
+                duration_ms = int((datetime.now(timezone.utc) - t_start).total_seconds() * 1000)
+                step_result["status"] = "ok"
+                step_result["finished_at"] = datetime.now(timezone.utc).isoformat()
+                step_result["duration_ms"] = duration_ms
+                step_result["outputs"] = outputs
+                
+                # Store outputs in context
+                self.context.outputs[tool_id] = outputs
+                
+                results["steps_executed"] += 1
+                self.context.log(f"[{tool_id}] Completed in {duration_ms}ms")
+                
+            except Exception as e:
+                duration_ms = int((datetime.now(timezone.utc) - t_start).total_seconds() * 1000)
+                step_result["status"] = "error"
+                step_result["finished_at"] = datetime.now(timezone.utc).isoformat()
+                step_result["duration_ms"] = duration_ms
+                step_result["error"] = str(e)
+                
+                results["steps_failed"] += 1
+                results["success"] = False
+                results["error"] = f"Step {tool_id} failed: {e}"
+                
+                self.context.log(f"[{tool_id}] Error: {e}")
+                
+                # Stop pipeline on error
+                break
+            
+            results["steps"].append(step_result)
+        
+        return results
+    
+    def get_debug_info(self) -> dict:
+        """Get debug info for all steps."""
+        return {"steps": self.steps_debug}
+
+
+# ============== Utility functions ==============
+
+async def run_cmd(cmd: list[str], log_cb: Callable[[str], None]) -> tuple[str, str]:
+    """Run a command and return stdout/stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    stdout_dec = stdout.decode(errors="ignore") if stdout else ""
+    stderr_dec = stderr.decode(errors="ignore") if stderr else ""
+    
+    if stdout_dec:
+        log_cb(stdout_dec[:1000])
+    if stderr_dec:
+        log_cb(stderr_dec[:1000])
+    
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed with code {proc.returncode}: {' '.join(cmd[:5])}...; "
+            f"stderr: {stderr_dec[-400:]}"
+        )
+    return stdout_dec, stderr_dec
+
+
+async def download_file(
+    url: str,
+    dest: Path,
+    log_cb: Callable[[str], None],
+    retries: int = 2,
+    timeout: float = 60.0,
+) -> None:
+    """Download a file with retries."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    min_size = 200 * 1024  # 200KB
+    
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+    }
+    
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 2):
+        try:
+            log_cb(f"Download attempt {attempt}: {url[:100]}...")
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                async with client.stream("GET", url) as resp:
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if resp.status_code >= 400:
+                        raise RuntimeError(f"Download failed with status {resp.status_code}")
+                    
+                    with dest.open("wb") as f:
+                        async for chunk in resp.aiter_bytes():
+                            f.write(chunk)
+            
+            size = dest.stat().st_size
+            log_cb(f"Downloaded {size} bytes to {dest.name}")
+            
+            if size < min_size:
+                raise RuntimeError(f"File too small: {size} bytes")
+            
+            # Validate it's a video
+            with dest.open("rb") as f:
+                head = f.read(2048)
+                if b"<html" in head.lower() or b"<!doctype" in head.lower():
+                    raise RuntimeError("Downloaded HTML instead of video")
+                if b"ftyp" not in head and b"moov" not in head:
+                    log_cb("Warning: No ftyp/moov marker, may not be valid video")
+            
+            return
+            
+        except Exception as e:
+            last_exc = e
+            if dest.exists():
+                dest.unlink()
+            log_cb(f"Download failed: {e}")
+            if attempt <= retries:
+                await asyncio.sleep(1.5 * attempt)
+    
+    raise RuntimeError(f"Download failed after {retries + 1} attempts: {last_exc}")
+
+
+async def download_via_ytdlp(
+    url: str,
+    dest: Path,
+    log_cb: Callable[[str], None],
+) -> None:
+    """Download video using yt-dlp."""
+    cmd = [
+        "yt-dlp",
+        "-f", "best[ext=mp4]/best",
+        "-o", str(dest),
+        "--no-playlist",
+        "--no-warnings",
+        url,
+    ]
+    log_cb(f"yt-dlp download: {url[:80]}...")
+    await run_cmd(cmd, log_cb)
+    
+    if not dest.exists():
+        raise RuntimeError("yt-dlp did not create output file")
+
+
+# ============== Step Handlers ==============
+
+@PipelineExecutor.register("T01_DOWNLOAD")
+async def handle_download(ctx: StepContext, params: dict) -> dict:
+    """Download source video."""
+    if not ctx.download_url:
+        raise RuntimeError("No download_url provided")
+    
+    try:
+        await download_file(ctx.download_url, ctx.raw_path, ctx.log)
+    except Exception as e:
+        # Fallback to yt-dlp
+        if ctx.permalink:
+            ctx.log(f"Direct download failed ({e}), trying yt-dlp")
+            await download_via_ytdlp(ctx.permalink, ctx.raw_path, ctx.log)
+        else:
+            raise
+    
+    ctx.current_video = ctx.raw_path
+    return {"path": str(ctx.raw_path), "size": ctx.raw_path.stat().st_size}
+
+
+@PipelineExecutor.register("T02_PROBE")
+async def handle_probe(ctx: StepContext, params: dict) -> dict:
+    """Probe video metadata with ffprobe."""
+    input_path = ctx.get_input_video()
+    
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-print_format", "json",
+        "-show_streams", "-show_format",
+        str(input_path),
+    ]
+    
+    stdout, _ = await run_cmd(cmd, ctx.log)
+    probe_data = json.loads(stdout) if stdout else {}
+    
+    # Save probe data
+    ctx.probe_data = probe_data
+    ctx.probe_path.write_text(json.dumps(probe_data, indent=2))
+    
+    # Extract key info
+    duration = None
+    width = None
+    height = None
+    
+    for stream in probe_data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            width = stream.get("width")
+            height = stream.get("height")
+            duration = stream.get("duration")
+            break
+    
+    if not duration:
+        duration = probe_data.get("format", {}).get("duration")
+    
+    return {
+        "duration": float(duration) if duration else None,
+        "width": width,
+        "height": height,
+        "probe_path": str(ctx.probe_path),
+    }
+
+
+@PipelineExecutor.register("T05_THUMBNAIL")
+async def handle_thumbnail(ctx: StepContext, params: dict) -> dict:
+    """Extract thumbnail from video."""
+    input_path = ctx.get_input_video()
+    timestamp = params.get("timestamp", "00:00:01")
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", timestamp,
+        "-i", str(input_path),
+        "-frames:v", "1",
+        "-q:v", "2",
+        str(ctx.thumb_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    return {"path": str(ctx.thumb_path)}
+
+
+@PipelineExecutor.register("T04_CROP_RESIZE")
+async def handle_crop_resize(ctx: StepContext, params: dict) -> dict:
+    """Crop and resize video to vertical format (9:16)."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.ready_path
+    
+    width = params.get("width", 1080)
+    height = params.get("height", 1920)
+    crf = params.get("crf", 20)
+    
+    vf = f"scale='if(gte(a,{width}/{height}),-2,{width})':'if(gte(a,{width}/{height}),{height},-2)',crop={width}:{height},setsar=1"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-map", "0:v:0",
+        "-map", "0:a?:0",
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", str(crf),
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path), "size": output_path.stat().st_size}
+
+
+@PipelineExecutor.register("T05_PREVIEW")
+async def handle_preview(ctx: StepContext, params: dict) -> dict:
+    """Create short preview clip (legacy, use T05_THUMBNAIL)."""
+    input_path = ctx.get_input_video()
+    duration = params.get("duration", 5)
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-t", str(duration),
+        "-an",
+        "-vf", "scale=480:-2",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        str(ctx.preview_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    return {"path": str(ctx.preview_path)}
+
+
+@PipelineExecutor.register("T10_WATERMARK_OLD")
+async def handle_watermark_old(ctx: StepContext, params: dict) -> dict:
+    """Add watermark overlay to video (legacy, use T16_WATERMARK)."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.task_dir / "watermarked.mp4"
+    
+    text = params.get("text", "@channel")
+    position = params.get("position", "bottom")  # top, bottom, center
+    fontsize = params.get("fontsize", 24)
+    
+    y_pos = {
+        "top": "50",
+        "center": "(h-text_h)/2",
+        "bottom": "h-th-50",
+    }.get(position, "h-th-50")
+    
+    vf = f"drawtext=text='{text}':fontsize={fontsize}:fontcolor=white:x=(w-text_w)/2:y={y_pos}:shadowcolor=black:shadowx=2:shadowy=2"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-c:a", "copy",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path)}
+
+
+@PipelineExecutor.register("T14_BURN_CAPTIONS")
+async def handle_burn_captions(ctx: StepContext, params: dict) -> dict:
+    """Burn captions/subtitles into video."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.final_path
+    
+    text = ctx.caption_text or params.get("text", "")
+    fontsize = params.get("fontsize", 36)
+    outline = params.get("outline", 2)
+    
+    if not text:
+        ctx.log("No caption text, skipping burn")
+        return {"skipped": True}
+    
+    # Create simple SRT file
+    srt_content = f"1\n00:00:00,000 --> 00:00:05,000\n{text}\n"
+    ctx.captions_path.write_text(srt_content, encoding="utf-8")
+    
+    vf = f"subtitles={ctx.captions_path}:force_style='FontSize={fontsize},Outline={outline}'"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-map", "0:v:0",
+        "-map", "0:a?:0",
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path), "captions_path": str(ctx.captions_path)}
+
+
+@PipelineExecutor.register("T20_SPEED")
+async def handle_speed(ctx: StepContext, params: dict) -> dict:
+    """Change video speed."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.task_dir / "speed.mp4"
+    
+    speed = params.get("speed", 1.0)
+    if speed == 1.0:
+        return {"skipped": True}
+    
+    # Video speed: setpts=PTS/speed, Audio: atempo=speed
+    video_filter = f"setpts=PTS/{speed}"
+    audio_filter = f"atempo={speed}" if 0.5 <= speed <= 2.0 else f"atempo={min(max(speed, 0.5), 2.0)}"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vf", video_filter,
+        "-af", audio_filter,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path), "speed": speed}
+
+
+@PipelineExecutor.register("T21_TRIM")
+async def handle_trim(ctx: StepContext, params: dict) -> dict:
+    """Trim video to specified duration."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.task_dir / "trimmed.mp4"
+    
+    start = params.get("start", 0)
+    duration = params.get("duration")
+    end = params.get("end")
+    
+    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+    
+    if start:
+        cmd.extend(["-ss", str(start)])
+    if duration:
+        cmd.extend(["-t", str(duration)])
+    elif end:
+        cmd.extend(["-to", str(end)])
+    
+    cmd.extend([
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-c:a", "aac",
+        str(output_path),
+    ])
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path)}
+
+
+@PipelineExecutor.register("T30_COPY_READY")
+async def handle_copy_ready(ctx: StepContext, params: dict) -> dict:
+    """Copy current video to ready.mp4 without re-encoding."""
+    input_path = ctx.get_input_video()
+    
+    if input_path == ctx.ready_path:
+        return {"skipped": True, "reason": "already at ready_path"}
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-c", "copy",
+        str(ctx.ready_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(ctx.ready_path)
+    
+    return {"path": str(ctx.ready_path)}
+
+
+# ============== New Tool Handlers ==============
+
+@PipelineExecutor.register("T03_NORMALIZE")
+async def handle_normalize(ctx: StepContext, params: dict) -> dict:
+    """Normalize video: fps, codec, color space."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.task_dir / "normalized.mp4"
+    
+    target_fps = params.get("target_fps", 30)
+    codec = params.get("codec", "h264")
+    crf = params.get("crf", 23)
+    
+    codec_lib = "libx264" if codec == "h264" else "libx265"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-r", str(target_fps),
+        "-c:v", codec_lib,
+        "-preset", "medium",
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "48000",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path), "fps": target_fps, "codec": codec}
+
+
+@PipelineExecutor.register("T07_EXTRACT_AUDIO")
+async def handle_extract_audio(ctx: StepContext, params: dict) -> dict:
+    """Extract audio track from video."""
+    input_path = ctx.get_input_video()
+    audio_format = params.get("format", "wav")
+    sample_rate = params.get("sample_rate", 44100)
+    
+    ext = audio_format if audio_format in ["wav", "mp3", "aac"] else "wav"
+    output_path = ctx.task_dir / f"audio.{ext}"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vn",
+        "-ar", str(sample_rate),
+    ]
+    
+    if ext == "wav":
+        cmd.extend(["-c:a", "pcm_s16le"])
+    elif ext == "mp3":
+        cmd.extend(["-c:a", "libmp3lame", "-b:a", "192k"])
+    else:
+        cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+    
+    cmd.append(str(output_path))
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.outputs["audio_path"] = str(output_path)
+    
+    return {"path": str(output_path), "format": ext, "sample_rate": sample_rate}
+
+
+@PipelineExecutor.register("T06_BG_MUSIC")
+async def handle_bg_music(ctx: StepContext, params: dict) -> dict:
+    """Add background music to video."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.task_dir / "with_music.mp4"
+    
+    music_path = params.get("music_path")
+    volume = params.get("volume", 0.3)
+    fade_in = params.get("fade_in", 2)
+    fade_out = params.get("fade_out", 2)
+    
+    if not music_path:
+        ctx.log("No music_path provided, skipping background music")
+        return {"skipped": True}
+    
+    # Get video duration for fade out timing
+    duration = ctx.probe_data.get("format", {}).get("duration")
+    dur_float = float(duration) if duration else 60
+    
+    # Build audio filter for music with fade and volume
+    music_filter = f"volume={volume}"
+    if fade_in > 0:
+        music_filter = f"afade=t=in:d={fade_in},{music_filter}"
+    if fade_out > 0 and dur_float > fade_out:
+        music_filter = f"{music_filter},afade=t=out:st={dur_float - fade_out}:d={fade_out}"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-i", str(music_path),
+        "-filter_complex",
+        f"[1:a]{music_filter}[music];[0:a][music]amix=inputs=2:duration=first[out]",
+        "-map", "0:v:0",
+        "-map", "[out]",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path), "volume": volume}
+
+
+@PipelineExecutor.register("T12_REPLACE_AUDIO")
+async def handle_replace_audio(ctx: StepContext, params: dict) -> dict:
+    """Replace audio track in video."""
+    input_path = ctx.get_input_video()
+    audio_path = params.get("audio_path") or ctx.outputs.get("mixed_audio") or ctx.outputs.get("audio_path")
+    output_path = ctx.task_dir / "replaced_audio.mp4"
+    
+    if not audio_path:
+        ctx.log("No audio path provided, keeping original audio")
+        return {"skipped": True}
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path)}
+
+
+@PipelineExecutor.register("T15_EFFECTS")
+async def handle_effects(ctx: StepContext, params: dict) -> dict:
+    """Apply visual effects for uniqueness."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.task_dir / "effects.mp4"
+    
+    mirror = params.get("mirror", False)
+    zoom_max = params.get("zoom_max", 1.0)
+    color_shift = params.get("color_shift", 0)
+    grain = params.get("grain", 0)
+    strip_metadata = params.get("strip_metadata", True)
+    
+    filters = []
+    
+    # Mirror (horizontal flip)
+    if mirror:
+        filters.append("hflip")
+    
+    # Random zoom (slight)
+    if zoom_max > 1.0:
+        zoom_val = zoom_max
+        filters.append(f"scale=iw*{zoom_val}:ih*{zoom_val},crop=iw/{zoom_val}:ih/{zoom_val}")
+    
+    # Color shift (hue rotation)
+    if color_shift != 0:
+        filters.append(f"hue=h={color_shift}")
+    
+    # Film grain
+    if grain > 0:
+        filters.append(f"noise=c0s={int(grain * 20)}:c0f=t+u")
+    
+    vf = ",".join(filters) if filters else None
+    
+    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+    
+    if vf:
+        cmd.extend(["-vf", vf])
+    
+    cmd.extend([
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",
+        "-c:a", "copy",
+    ])
+    
+    if strip_metadata:
+        cmd.extend(["-map_metadata", "-1"])
+    
+    cmd.append(str(output_path))
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {
+        "path": str(output_path),
+        "effects_applied": {
+            "mirror": mirror,
+            "zoom": zoom_max,
+            "color_shift": color_shift,
+            "grain": grain,
+        }
+    }
+
+
+@PipelineExecutor.register("T16_WATERMARK")
+async def handle_watermark_new(ctx: StepContext, params: dict) -> dict:
+    """Add watermark (text or image) to video."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.task_dir / "watermarked.mp4"
+    
+    wm_type = params.get("type", "text")
+    position = params.get("position", "bottom_right")
+    opacity = params.get("opacity", 0.7)
+    margin = params.get("margin", 20)
+    
+    # Position mapping
+    pos_map = {
+        "top_left": f"x={margin}:y={margin}",
+        "top_right": f"x=w-tw-{margin}:y={margin}",
+        "bottom_left": f"x={margin}:y=h-th-{margin}",
+        "bottom_right": f"x=w-tw-{margin}:y=h-th-{margin}",
+        "center": "x=(w-tw)/2:y=(h-th)/2",
+    }
+    pos_expr = pos_map.get(position, pos_map["bottom_right"])
+    
+    if wm_type == "text":
+        text = params.get("text", "@channel")
+        size = params.get("size", 24)
+        
+        # Escape special characters
+        text_escaped = text.replace("'", "\\'").replace(":", "\\:")
+        
+        vf = f"drawtext=text='{text_escaped}':fontsize={size}:fontcolor=white@{opacity}:{pos_expr}:shadowcolor=black@0.5:shadowx=2:shadowy=2"
+    else:
+        # Image watermark
+        image_path = params.get("image_path")
+        if not image_path:
+            ctx.log("No image path for watermark, skipping")
+            return {"skipped": True}
+        
+        vf = f"movie={image_path}[wm];[in][wm]overlay={pos_expr.replace('tw', 'overlay_w').replace('th', 'overlay_h')}"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",
+        "-c:a", "copy",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    return {"path": str(output_path), "type": wm_type, "position": position}
+
+
+@PipelineExecutor.register("T17_PACKAGE")
+async def handle_package(ctx: StepContext, params: dict) -> dict:
+    """Final packaging with optimized encoding."""
+    input_path = ctx.get_input_video()
+    output_path = ctx.final_path
+    
+    codec = params.get("codec", "h264")
+    preset = params.get("preset", "slow")
+    crf = params.get("crf", 20)
+    audio_bitrate = params.get("audio_bitrate", "192k")
+    
+    codec_lib = "libx264" if codec == "h264" else "libx265"
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-c:v", codec_lib,
+        "-preset", preset,
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-movflags", "+faststart",
+        "-map_metadata", "-1",
+        str(output_path),
+    ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.set_output_video(output_path)
+    
+    size = output_path.stat().st_size
+    return {"path": str(output_path), "size": size, "codec": codec}
+
+
+@PipelineExecutor.register("T18_QC")
+async def handle_qc(ctx: StepContext, params: dict) -> dict:
+    """Quality control check."""
+    input_path = ctx.get_input_video()
+    
+    min_bitrate = params.get("min_bitrate", "2M")
+    check_audio = params.get("check_audio_levels", True)
+    
+    # Probe the video
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-print_format", "json",
+        "-show_streams", "-show_format",
+        str(input_path),
+    ]
+    
+    stdout, _ = await run_cmd(cmd, ctx.log)
+    probe_data = json.loads(stdout) if stdout else {}
+    
+    warnings = []
+    errors = []
+    
+    # Check video stream
+    video_stream = None
+    audio_stream = None
+    for stream in probe_data.get("streams", []):
+        if stream.get("codec_type") == "video" and not video_stream:
+            video_stream = stream
+        elif stream.get("codec_type") == "audio" and not audio_stream:
+            audio_stream = stream
+    
+    if not video_stream:
+        errors.append("No video stream found")
+    else:
+        width = video_stream.get("width", 0)
+        height = video_stream.get("height", 0)
+        if width < 720 or height < 720:
+            warnings.append(f"Low resolution: {width}x{height}")
+    
+    if not audio_stream and check_audio:
+        warnings.append("No audio stream found")
+    
+    # Check bitrate
+    format_info = probe_data.get("format", {})
+    bitrate = int(format_info.get("bit_rate", 0))
+    min_br_val = int(min_bitrate.replace("M", "000000").replace("k", "000"))
+    
+    if bitrate > 0 and bitrate < min_br_val:
+        warnings.append(f"Low bitrate: {bitrate / 1_000_000:.2f} Mbps")
+    
+    # Check file size
+    size = int(format_info.get("size", 0))
+    if size < 500_000:
+        warnings.append(f"Small file size: {size / 1024:.1f} KB")
+    
+    passed = len(errors) == 0
+    if params.get("fail_on_warning", False) and warnings:
+        passed = False
+    
+    result = {
+        "passed": passed,
+        "warnings": warnings,
+        "errors": errors,
+        "video_info": {
+            "width": video_stream.get("width") if video_stream else None,
+            "height": video_stream.get("height") if video_stream else None,
+            "codec": video_stream.get("codec_name") if video_stream else None,
+        },
+        "audio_info": {
+            "codec": audio_stream.get("codec_name") if audio_stream else None,
+            "sample_rate": audio_stream.get("sample_rate") if audio_stream else None,
+        },
+        "bitrate_mbps": bitrate / 1_000_000 if bitrate else None,
+        "size_mb": size / 1_000_000 if size else None,
+    }
+    
+    if not passed:
+        raise RuntimeError(f"QC failed: {errors + warnings}")
+    
+    # Copy to ready if passed
+    if input_path != ctx.ready_path:
+        import shutil
+        shutil.copy2(input_path, ctx.ready_path)
+        ctx.set_output_video(ctx.ready_path)
+    
+    return result
+
+
+@PipelineExecutor.register("T08_SPEECH_TO_TEXT")
+async def handle_speech_to_text(ctx: StepContext, params: dict) -> dict:
+    """Transcribe audio using Whisper."""
+    import os
+    
+    # Get audio path from previous step or extract
+    audio_path = ctx.outputs.get("audio_path")
+    if not audio_path:
+        # Extract audio first
+        input_video = ctx.get_input_video()
+        audio_path = ctx.task_dir / "audio_for_stt.wav"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_video),
+            "-vn", "-ar", "16000", "-ac", "1",
+            "-c:a", "pcm_s16le",
+            str(audio_path),
+        ]
+        await run_cmd(cmd, ctx.log)
+    
+    model = params.get("model", "base")
+    language = params.get("language")  # None = auto-detect
+    
+    # Check if whisper is available
+    whisper_cmd = params.get("whisper_cmd", "whisper")
+    
+    output_dir = ctx.task_dir / "whisper_out"
+    output_dir.mkdir(exist_ok=True)
+    
+    cmd = [
+        whisper_cmd,
+        str(audio_path),
+        "--model", model,
+        "--output_dir", str(output_dir),
+        "--output_format", "all",
+    ]
+    
+    if language:
+        cmd.extend(["--language", language])
+    
+    try:
+        await run_cmd(cmd, ctx.log)
+    except Exception as e:
+        # Fallback: try with openai-whisper python module
+        ctx.log(f"CLI whisper failed ({e}), trying Python module")
+        try:
+            import whisper as whisper_module
+            model_obj = whisper_module.load_model(model)
+            result = model_obj.transcribe(str(audio_path), language=language)
+            
+            # Save outputs
+            text = result.get("text", "")
+            segments = result.get("segments", [])
+            
+            # Save text
+            txt_path = output_dir / "transcript.txt"
+            txt_path.write_text(text, encoding="utf-8")
+            
+            # Save SRT
+            srt_path = output_dir / "transcript.srt"
+            srt_content = _segments_to_srt(segments)
+            srt_path.write_text(srt_content, encoding="utf-8")
+            
+            # Save JSON
+            json_path = output_dir / "transcript.json"
+            json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            
+            ctx.caption_text = text
+            ctx.outputs["transcript_text"] = text
+            ctx.outputs["transcript_segments"] = segments
+            ctx.outputs["srt_path"] = str(srt_path)
+            
+            return {
+                "text": text[:500] + "..." if len(text) > 500 else text,
+                "language": result.get("language"),
+                "segments_count": len(segments),
+                "srt_path": str(srt_path),
+                "txt_path": str(txt_path),
+            }
+        except ImportError:
+            raise RuntimeError("Whisper not available. Install with: pip install openai-whisper")
+    
+    # Parse CLI output
+    srt_files = list(output_dir.glob("*.srt"))
+    txt_files = list(output_dir.glob("*.txt"))
+    json_files = list(output_dir.glob("*.json"))
+    
+    text = ""
+    if txt_files:
+        text = txt_files[0].read_text(encoding="utf-8")
+    
+    srt_path = str(srt_files[0]) if srt_files else None
+    
+    ctx.caption_text = text
+    ctx.outputs["transcript_text"] = text
+    ctx.outputs["srt_path"] = srt_path
+    
+    return {
+        "text": text[:500] + "..." if len(text) > 500 else text,
+        "srt_path": srt_path,
+        "txt_path": str(txt_files[0]) if txt_files else None,
+    }
+
+
+def _segments_to_srt(segments: list) -> str:
+    """Convert Whisper segments to SRT format."""
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        start = _format_srt_time(seg.get("start", 0))
+        end = _format_srt_time(seg.get("end", 0))
+        text = seg.get("text", "").strip()
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
+
+
+def _format_srt_time(seconds: float) -> str:
+    """Format seconds to SRT time format."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+@PipelineExecutor.register("T09_TRANSLATE")
+async def handle_translate_text(ctx: StepContext, params: dict) -> dict:
+    """Translate transcribed text."""
+    import os
+    
+    text = ctx.outputs.get("transcript_text") or ctx.caption_text
+    if not text:
+        ctx.log("No text to translate")
+        return {"skipped": True}
+    
+    source_lang = params.get("source_lang", "auto")
+    target_lang = params.get("target_lang", "ru")
+    provider = params.get("provider", "google")
+    
+    if provider == "google":
+        # Use deep-translator library
+        try:
+            from deep_translator import GoogleTranslator
+            
+            # Split into chunks if too long (deep-translator limit is 5000)
+            max_chunk = 4500
+            chunks = [text[i:i+max_chunk] for i in range(0, len(text), max_chunk)]
+            translated_chunks = []
+            
+            src = source_lang if source_lang != "auto" else "auto"
+            translator = GoogleTranslator(source=src, target=target_lang)
+            
+            for chunk in chunks:
+                result = translator.translate(chunk)
+                translated_chunks.append(result)
+            
+            translated = " ".join(translated_chunks)
+            detected_lang = source_lang
+            
+        except ImportError:
+            ctx.log("deep-translator not installed, using placeholder")
+            translated = f"[TRANSLATION TO {target_lang}]: {text[:200]}..."
+            detected_lang = source_lang
+    
+    elif provider == "deepl":
+        # DeepL API
+        api_key = os.environ.get("DEEPL_API_KEY")
+        if not api_key:
+            raise RuntimeError("DEEPL_API_KEY not set")
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api-free.deepl.com/v2/translate",
+                data={
+                    "auth_key": api_key,
+                    "text": text,
+                    "target_lang": target_lang.upper(),
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            translated = data["translations"][0]["text"]
+            detected_lang = data["translations"][0].get("detected_source_language", source_lang)
+    
+    else:
+        translated = text
+        detected_lang = source_lang
+    
+    # Save translated text
+    translated_path = ctx.task_dir / "translated.txt"
+    translated_path.write_text(translated, encoding="utf-8")
+    
+    ctx.outputs["translated_text"] = translated
+    ctx.caption_text = translated
+    
+    return {
+        "original_length": len(text),
+        "translated_length": len(translated),
+        "source_lang": detected_lang,
+        "target_lang": target_lang,
+        "path": str(translated_path),
+    }
+
+
+@PipelineExecutor.register("T10_VOICE_CONVERT")
+async def handle_voice_convert(ctx: StepContext, params: dict) -> dict:
+    """Convert voice using TTS or voice cloning."""
+    import os
+    
+    text = ctx.outputs.get("translated_text") or ctx.caption_text
+    if not text:
+        ctx.log("No text for voice synthesis")
+        return {"skipped": True}
+    
+    provider = params.get("provider", "edge_tts")
+    voice = params.get("voice", "ru-RU-DmitryNeural")
+    output_path = ctx.task_dir / "voice_synth.mp3"
+    
+    if provider == "edge_tts":
+        # Microsoft Edge TTS (free)
+        try:
+            import edge_tts
+            
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(str(output_path))
+            
+        except ImportError:
+            ctx.log("edge_tts not installed, using placeholder")
+            # Create silent audio as placeholder
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                "-t", "5",
+                str(output_path),
+            ]
+            await run_cmd(cmd, ctx.log)
+    
+    elif provider == "elevenlabs":
+        api_key = os.environ.get("ELEVENLABS_API_KEY")
+        voice_id = params.get("voice_id", "21m00Tcm4TlvDq8ikWAM")
+        
+        if not api_key:
+            raise RuntimeError("ELEVENLABS_API_KEY not set")
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                headers={"xi-api-key": api_key},
+                json={
+                    "text": text,
+                    "model_id": "eleven_multilingual_v2",
+                }
+            )
+            resp.raise_for_status()
+            
+            with output_path.open("wb") as f:
+                f.write(resp.content)
+    
+    ctx.outputs["synth_audio_path"] = str(output_path)
+    
+    return {
+        "path": str(output_path),
+        "provider": provider,
+        "voice": voice,
+        "size": output_path.stat().st_size,
+    }
+
+
+@PipelineExecutor.register("T11_AUDIO_MIX")
+async def handle_mix_audio(ctx: StepContext, params: dict) -> dict:
+    """Mix original audio with synthesized voice."""
+    original_audio = ctx.outputs.get("audio_path")
+    synth_audio = ctx.outputs.get("synth_audio_path")
+    
+    if not synth_audio:
+        ctx.log("No synthesized audio to mix")
+        return {"skipped": True}
+    
+    output_path = ctx.task_dir / "mixed_audio.mp3"
+    
+    voice_volume = params.get("voice_volume", 1.0)
+    music_volume = params.get("music_volume", 0.3)
+    
+    if original_audio:
+        # Mix both tracks
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(synth_audio),
+            "-i", str(original_audio),
+            "-filter_complex",
+            f"[0:a]volume={voice_volume}[voice];[1:a]volume={music_volume}[bg];[voice][bg]amix=inputs=2:duration=first[out]",
+            "-map", "[out]",
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            str(output_path),
+        ]
+    else:
+        # Just copy synth audio
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(synth_audio),
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            str(output_path),
+        ]
+    
+    await run_cmd(cmd, ctx.log)
+    ctx.outputs["mixed_audio"] = str(output_path)
+    
+    return {
+        "path": str(output_path),
+        "voice_volume": voice_volume,
+        "music_volume": music_volume,
+    }
+
+
+@PipelineExecutor.register("T13_BUILD_CAPTIONS")
+async def handle_build_captions(ctx: StepContext, params: dict) -> dict:
+    """Build styled ASS/SRT captions."""
+    segments = ctx.outputs.get("transcript_segments", [])
+    text = ctx.outputs.get("translated_text") or ctx.caption_text
+    
+    style = params.get("style", "default")
+    format_type = params.get("format", "ass")
+    font = params.get("font", "Arial")
+    font_size = params.get("font_size", 48)
+    outline = params.get("outline", 2)
+    position = params.get("position", "bottom")  # bottom, top, center
+    
+    if format_type == "ass":
+        output_path = ctx.task_dir / "captions.ass"
+        content = _build_ass_file(
+            segments=segments,
+            text=text,
+            font=font,
+            font_size=font_size,
+            outline=outline,
+            position=position,
+            style=style,
+        )
+    else:
+        output_path = ctx.task_dir / "captions.srt"
+        if segments:
+            content = _segments_to_srt(segments)
+        else:
+            # Simple single subtitle
+            content = f"1\n00:00:00,000 --> 00:00:10,000\n{text[:200] if text else ''}\n"
+    
+    output_path.write_text(content, encoding="utf-8")
+    ctx.outputs["captions_path"] = str(output_path)
+    ctx.captions_path = output_path
+    
+    return {
+        "path": str(output_path),
+        "format": format_type,
+        "segments_count": len(segments),
+        "style": style,
+    }
+
+
+def _build_ass_file(
+    segments: list,
+    text: str,
+    font: str,
+    font_size: int,
+    outline: int,
+    position: str,
+    style: str,
+) -> str:
+    """Build ASS subtitle file."""
+    # Alignment: 1=left, 2=center, 3=right; +0=bottom, +4=middle, +8=top
+    alignment = {"bottom": 2, "top": 8, "center": 5}.get(position, 2)
+    
+    # Style presets
+    styles = {
+        "default": {"primary": "&H00FFFFFF", "outline_color": "&H00000000", "bold": 0},
+        "bold": {"primary": "&H00FFFFFF", "outline_color": "&H00000000", "bold": 1},
+        "yellow": {"primary": "&H0000FFFF", "outline_color": "&H00000000", "bold": 1},
+        "gradient": {"primary": "&H00FF88FF", "outline_color": "&H00440044", "bold": 1},
+        "neon": {"primary": "&H0000FF00", "outline_color": "&H00FF00FF", "bold": 1},
+    }
+    
+    style_params = styles.get(style, styles["default"])
+    
+    header = f"""[Script Info]
+Title: Auto Generated Captions
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font},{font_size},{style_params['primary']},&H000000FF,{style_params['outline_color']},&H80000000,{style_params['bold']},0,0,0,100,100,0,0,1,{outline},1,{alignment},50,50,50,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    
+    events = []
+    if segments:
+        for seg in segments:
+            start = _format_ass_time(seg.get("start", 0))
+            end = _format_ass_time(seg.get("end", 0))
+            seg_text = seg.get("text", "").strip().replace("\n", "\\N")
+            events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{seg_text}")
+    elif text:
+        # Single caption
+        events.append(f"Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{text[:100]}")
+    
+    return header + "\n".join(events) + "\n"
+
+
+def _format_ass_time(seconds: float) -> str:
+    """Format seconds to ASS time format (H:MM:SS.cc)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centis = int((seconds % 1) * 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"

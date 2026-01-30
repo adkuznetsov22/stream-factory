@@ -1,0 +1,43 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environment
+*.env
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Next.js
+frontend/.next/
+frontend/node_modules/
+.next/
+
+# Build
+dist/
+build/
+
+# Data
+*.db
+*.sqlite
+uploads/
+files/tasks/
+
+# IDE
+.idea/
+.vscode/
+*.swp
