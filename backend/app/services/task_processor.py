@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import Project, Preset, PublishTask
+from app.models import ExportProfile, Project, Preset, PublishTask
 from app.services.pipeline_executor import PipelineExecutor, StepContext
 
 
@@ -95,6 +95,26 @@ class TaskProcessor:
         # Populate project policy for QC enforcement
         if project and project.policy and isinstance(project.policy, dict):
             ctx.policy = project.policy
+        
+        # Populate export profile for encoding steps
+        if project and project.export_profile_id:
+            ep = await self.session.get(ExportProfile, project.export_profile_id)
+            if ep:
+                ctx.export_profile = {
+                    "name": ep.name,
+                    "target_platform": ep.target_platform,
+                    "max_duration_sec": ep.max_duration_sec,
+                    "width": ep.width,
+                    "height": ep.height,
+                    "fps": ep.fps,
+                    "codec": ep.codec,
+                    "video_bitrate": ep.video_bitrate,
+                    "audio_bitrate": ep.audio_bitrate,
+                    "audio_sample_rate": ep.audio_sample_rate,
+                    "safe_area": ep.safe_area or {},
+                    "extra": ep.extra or {},
+                }
+                log_cb(f"Export profile: {ep.name} ({ep.target_platform})")
         
         # Build step list
         steps = self._build_steps(preset, task)

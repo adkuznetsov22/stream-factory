@@ -422,6 +422,27 @@ class InstagramPost(Base):
     account: Mapped[SocialAccount] = relationship(back_populates="instagram_posts")
 
 
+class ExportProfile(Base):
+    """Platform-specific export parameters for final video packaging."""
+    __tablename__ = "export_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    target_platform: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    max_duration_sec: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="60")
+    width: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="1080")
+    height: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="1920")
+    fps: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="30")
+    codec: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="h264")
+    video_bitrate: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="8M")
+    audio_bitrate: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="192k")
+    audio_sample_rate: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="44100")
+    safe_area: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    extra: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    is_builtin: Mapped[bool] = mapped_column(sa.Boolean(), nullable=False, server_default=sa.false())
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+
+
 class Project(Base):
     __tablename__ = "projects"
 
@@ -432,6 +453,9 @@ class Project(Base):
     mode: Mapped[str] = mapped_column(sa.Text(), nullable=False, server_default="MANUAL")
     settings_json: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
     policy: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    export_profile_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("export_profiles.id", ondelete="SET NULL"), nullable=True
+    )
     preset_id: Mapped[int | None] = mapped_column(sa.ForeignKey("presets.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -454,6 +478,7 @@ class Project(Base):
         back_populates="project", cascade="save-update", passive_deletes=True
     )
     preset: Mapped["Preset | None"] = relationship(back_populates="projects")
+    export_profile: Mapped["ExportProfile | None"] = relationship()
     candidates: Mapped[list["Candidate"]] = relationship(
         back_populates="project", cascade="all, delete-orphan", passive_deletes=True
     )

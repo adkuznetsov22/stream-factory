@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db import get_session
 from app.models import (
+    ExportProfile,
     Project,
     Preset,
     PresetStep,
@@ -31,6 +32,7 @@ from app.models import (
     YouTubeVideo,
 )
 from app.schemas import (
+    ExportProfileRead,
     ProjectCreate,
     ProjectDestinationCreate,
     ProjectDestinationRead,
@@ -1601,3 +1603,10 @@ async def publish_task(task_id: int, session: AsyncSession = SessionDep):
     
     result = await auto_publisher.publish_task(session, task_id)
     return result
+
+
+@router.get("/export-profiles", response_model=list[ExportProfileRead])
+async def list_export_profiles(session: AsyncSession = SessionDep):
+    """Список всех доступных export-профилей."""
+    res = await session.execute(select(ExportProfile).order_by(ExportProfile.id))
+    return res.scalars().all()

@@ -59,6 +59,9 @@ class StepContext:
         # Project policy (required transformations)
         self.policy: dict = {}
         
+        # Export profile (platform-specific encoding params)
+        self.export_profile: dict = {}
+        
         # Step outputs accumulator
         self.outputs: dict[str, Any] = {}
     
@@ -394,13 +397,15 @@ async def handle_thumbnail(ctx: StepContext, params: dict) -> dict:
 
 @PipelineExecutor.register("T04_CROP_RESIZE")
 async def handle_crop_resize(ctx: StepContext, params: dict) -> dict:
-    """Crop and resize video to vertical format (9:16)."""
+    """Crop and resize video to vertical format (9:16). Respects export_profile."""
     input_path = ctx.get_input_video()
     output_path = ctx.ready_path
     
-    width = params.get("width", 1080)
-    height = params.get("height", 1920)
+    ep = ctx.export_profile
+    width = params.get("width") or ep.get("width") or 1080
+    height = params.get("height") or ep.get("height") or 1920
     crf = params.get("crf", 20)
+    audio_bitrate = ep.get("audio_bitrate") or "128k"
     
     vf = f"scale='if(gte(a,{width}/{height}),-2,{width})':'if(gte(a,{width}/{height}),{height},-2)',crop={width}:{height},setsar=1"
     
@@ -414,7 +419,7 @@ async def handle_crop_resize(ctx: StepContext, params: dict) -> dict:
         "-preset", "veryfast",
         "-crf", str(crf),
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", audio_bitrate,
         str(output_path),
     ]
     
@@ -483,13 +488,21 @@ async def handle_watermark_old(ctx: StepContext, params: dict) -> dict:
 
 @PipelineExecutor.register("T14_BURN_CAPTIONS")
 async def handle_burn_captions(ctx: StepContext, params: dict) -> dict:
-    """Burn captions/subtitles into video."""
+    """Burn captions/subtitles into video. Respects export_profile safe_area."""
     input_path = ctx.get_input_video()
     output_path = ctx.final_path
+    
+    ep = ctx.export_profile
+    safe = ep.get("safe_area", {})
     
     text = ctx.caption_text or params.get("text", "")
     fontsize = params.get("fontsize", 36)
     outline = params.get("outline", 2)
+    
+    # Вычисляем MarginV из safe_area.bottom чтобы субтитры не попадали в зону кнопок
+    margin_v = safe.get("bottom", 50) if safe else params.get("margin_v", 50)
+    margin_l = safe.get("left", 30) if safe else params.get("margin_l", 30)
+    margin_r = safe.get("right", 30) if safe else params.get("margin_r", 30)
     
     if not text:
         ctx.log("No caption text, skipping burn")
@@ -499,7 +512,13 @@ async def handle_burn_captions(ctx: StepContext, params: dict) -> dict:
     srt_content = f"1\n00:00:00,000 --> 00:00:05,000\n{text}\n"
     ctx.captions_path.write_text(srt_content, encoding="utf-8")
     
-    vf = f"subtitles={ctx.captions_path}:force_style='FontSize={fontsize},Outline={outline}'"
+    vf = (
+        f"subtitles={ctx.captions_path}:force_style='"
+        f"FontSize={fontsize},Outline={outline},"
+        f"MarginV={margin_v},MarginL={margin_l},MarginR={margin_r}'"
+    )
+    
+    audio_bitrate = ep.get("audio_bitrate") or "128k"
     
     cmd = [
         "ffmpeg", "-y",
@@ -511,7 +530,7 @@ async def handle_burn_captions(ctx: StepContext, params: dict) -> dict:
         "-preset", "veryfast",
         "-crf", "20",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", audio_bitrate,
         str(output_path),
     ]
     
@@ -610,13 +629,17 @@ async def handle_copy_ready(ctx: StepContext, params: dict) -> dict:
 
 @PipelineExecutor.register("T03_NORMALIZE")
 async def handle_normalize(ctx: StepContext, params: dict) -> dict:
-    """Normalize video: fps, codec, color space."""
+    """Normalize video: fps, codec, color space. Respects export_profile."""
     input_path = ctx.get_input_video()
     output_path = ctx.task_dir / "normalized.mp4"
     
-    target_fps = params.get("target_fps", 30)
-    codec = params.get("codec", "h264")
+    ep = ctx.export_profile
+    target_fps = params.get("target_fps") or ep.get("fps") or 30
+    codec = params.get("codec") or ep.get("codec") or "h264"
     crf = params.get("crf", 23)
+    audio_bitrate = ep.get("audio_bitrate") or "192k"
+    audio_sample_rate = ep.get("audio_sample_rate") or 48000
+    pix_fmt = ep.get("extra", {}).get("pixel_format") or "yuv420p"
     
     codec_lib = "libx264" if codec == "h264" else "libx265"
     
@@ -627,10 +650,10 @@ async def handle_normalize(ctx: StepContext, params: dict) -> dict:
         "-c:v", codec_lib,
         "-preset", "medium",
         "-crf", str(crf),
-        "-pix_fmt", "yuv420p",
+        "-pix_fmt", pix_fmt,
         "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "48000",
+        "-b:a", audio_bitrate,
+        "-ar", str(audio_sample_rate),
         str(output_path),
     ]
     
@@ -869,36 +892,69 @@ async def handle_watermark_new(ctx: StepContext, params: dict) -> dict:
 
 @PipelineExecutor.register("T17_PACKAGE")
 async def handle_package(ctx: StepContext, params: dict) -> dict:
-    """Final packaging with optimized encoding."""
+    """Final packaging with optimized encoding. Respects export_profile.
+
+    Applies: codec, bitrate, fps, max_duration, pixel_format, movflags
+    from the selected ExportProfile. Step params override profile values.
+    """
     input_path = ctx.get_input_video()
     output_path = ctx.final_path
     
-    codec = params.get("codec", "h264")
-    preset = params.get("preset", "slow")
+    ep = ctx.export_profile
+    ep_extra = ep.get("extra", {})
+    
+    codec = params.get("codec") or ep.get("codec") or "h264"
+    preset_enc = params.get("preset", "slow")
     crf = params.get("crf", 20)
-    audio_bitrate = params.get("audio_bitrate", "192k")
+    video_bitrate = params.get("video_bitrate") or ep.get("video_bitrate")
+    audio_bitrate = params.get("audio_bitrate") or ep.get("audio_bitrate") or "192k"
+    audio_sample_rate = ep.get("audio_sample_rate") or 44100
+    fps = ep.get("fps")
+    pix_fmt = ep_extra.get("pixel_format") or "yuv420p"
+    movflags = ep_extra.get("movflags") or "+faststart"
+    max_duration = ep.get("max_duration_sec")
     
     codec_lib = "libx264" if codec == "h264" else "libx265"
     
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-c:v", codec_lib,
-        "-preset", preset,
-        "-crf", str(crf),
-        "-pix_fmt", "yuv420p",
+    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+    
+    # Обрезка по max_duration если задан
+    if max_duration:
+        cmd.extend(["-t", str(max_duration)])
+    
+    cmd.extend(["-c:v", codec_lib, "-preset", preset_enc, "-crf", str(crf)])
+    
+    # Видео битрейт (если задан — использовать вместо CRF-only)
+    if video_bitrate:
+        cmd.extend(["-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", video_bitrate])
+    
+    if fps:
+        cmd.extend(["-r", str(fps)])
+    
+    cmd.extend([
+        "-pix_fmt", pix_fmt,
         "-c:a", "aac",
         "-b:a", audio_bitrate,
-        "-movflags", "+faststart",
+        "-ar", str(audio_sample_rate),
+        "-movflags", movflags,
         "-map_metadata", "-1",
         str(output_path),
-    ]
+    ])
     
     await run_cmd(cmd, ctx.log)
     ctx.set_output_video(output_path)
     
     size = output_path.stat().st_size
-    return {"path": str(output_path), "size": size, "codec": codec}
+    profile_name = ep.get("name", "default")
+    ctx.log(f"[T17_PACKAGE] Packaged with profile '{profile_name}': {codec}, {size} bytes")
+    
+    return {
+        "path": str(output_path),
+        "size": size,
+        "codec": codec,
+        "export_profile": profile_name,
+        "max_duration_sec": max_duration,
+    }
 
 
 @PipelineExecutor.register("T18_QC")

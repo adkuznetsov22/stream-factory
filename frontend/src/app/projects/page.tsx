@@ -16,6 +16,7 @@ type Project = {
   status: string;
   mode: string;
   preset_id?: number | null;
+  export_profile_id?: number | null;
   policy?: Policy | null;
 };
 
@@ -23,11 +24,13 @@ type Source = { id: number; platform: string; social_account_id: number };
 type Destination = { id: number; platform: string; social_account_id: number; priority: number };
 type Account = { id: number; platform: string; label: string };
 type Preset = { id: number; name: string };
+type ExportProfileItem = { id: number; name: string; target_platform: string; max_duration_sec: number; width: number; height: number; fps: number; codec: string };
 
 export default function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
+  const [exportProfiles, setExportProfiles] = useState<ExportProfileItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
@@ -37,14 +40,16 @@ export default function ProjectsPage() {
 
   const load = async () => {
     setLoading(true);
-    const [pRes, aRes, prRes] = await Promise.all([
+    const [pRes, aRes, prRes, epRes] = await Promise.all([
       fetch("/api/projects"),
       fetch("/api/accounts"),
       fetch("/api/presets"),
+      fetch("/api/export-profiles"),
     ]);
     if (pRes.ok) setProjects(await pRes.json());
     if (aRes.ok) setAccounts(await aRes.json());
     if (prRes.ok) setPresets(await prRes.json());
+    if (epRes.ok) setExportProfiles(await epRes.json());
     setLoading(false);
   };
 
@@ -237,6 +242,35 @@ export default function ProjectsPage() {
                           <option value="AUTO">Автоматический</option>
                         </select>
                       </div>
+                    </div>
+
+                    {/* Export Profile */}
+                    <div style={{ marginBottom: 24 }}>
+                      <span style={{ fontWeight: 600, fontSize: 14, display: "block", marginBottom: 12 }}>Профиль экспорта</span>
+                      <select
+                        value={p.export_profile_id || ""}
+                        onChange={e => updateProject(p.id, { export_profile_id: e.target.value ? Number(e.target.value) : null })}
+                        style={{ width: "100%", marginBottom: 8 }}
+                      >
+                        <option value="">Не выбран (параметры по умолчанию)</option>
+                        {exportProfiles.map(ep => (
+                          <option key={ep.id} value={ep.id}>
+                            {ep.name} — {ep.target_platform} ({ep.width}×{ep.height}, {ep.fps}fps, {ep.max_duration_sec}с)
+                          </option>
+                        ))}
+                      </select>
+                      {p.export_profile_id && (() => {
+                        const ep = exportProfiles.find(e => e.id === p.export_profile_id);
+                        return ep ? (
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: 11, color: "var(--fg-subtle)" }}>
+                            <span style={{ padding: "2px 8px", background: "var(--bg-hover)", borderRadius: 4 }}>{ep.target_platform}</span>
+                            <span style={{ padding: "2px 8px", background: "var(--bg-hover)", borderRadius: 4 }}>{ep.width}×{ep.height}</span>
+                            <span style={{ padding: "2px 8px", background: "var(--bg-hover)", borderRadius: 4 }}>{ep.fps} fps</span>
+                            <span style={{ padding: "2px 8px", background: "var(--bg-hover)", borderRadius: 4 }}>{ep.codec}</span>
+                            <span style={{ padding: "2px 8px", background: "var(--bg-hover)", borderRadius: 4 }}>≤{ep.max_duration_sec}с</span>
+                          </div>
+                        ) : null;
+                      })()}
                     </div>
 
                     {/* Policy */}

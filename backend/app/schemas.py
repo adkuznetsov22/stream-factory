@@ -108,6 +108,27 @@ class SocialAccountUpdate(BaseModel):
     youtube_channel_id: str | None = None
 
 
+# Export profiles
+class ExportProfileRead(BaseModel):
+    id: int
+    name: str
+    target_platform: str
+    max_duration_sec: int
+    width: int
+    height: int
+    fps: int
+    codec: str
+    video_bitrate: str
+    audio_bitrate: str
+    audio_sample_rate: int
+    safe_area: dict | None = None
+    extra: dict | None = None
+    is_builtin: bool
+
+    class Config:
+        from_attributes = True
+
+
 # Projects / Publish tasks
 class ProjectCreate(BaseModel):
     name: str
@@ -116,6 +137,7 @@ class ProjectCreate(BaseModel):
     mode: str | None = None
     settings_json: dict | None = None
     policy: dict | None = None
+    export_profile_id: int | None = None
     preset_id: int | None = None
 
 
@@ -127,6 +149,7 @@ class ProjectRead(BaseModel):
     mode: str
     settings_json: dict | None = None
     policy: dict | None = None
+    export_profile_id: int | None = None
     preset_id: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -142,6 +165,7 @@ class ProjectUpdate(BaseModel):
     mode: str | None = None
     settings_json: dict | None = None
     policy: dict | None = None
+    export_profile_id: int | None = None
     preset_id: int | None = None
 
 
