@@ -32,6 +32,20 @@ MAX_AGE_DAYS = 90              # fetch metrics for up to 90 days
 DETAIL_RETENTION_DAYS = 30     # keep detailed snapshots 30 days
 WEEKLY_RETENTION_DAYS = 180    # keep daily aggregates 180 days, then weekly
 
+# ── Per-platform rate limits & budget ────────────────────────
+# Max videos to fetch per platform per single sync run.
+# Apify-based platforms (TikTok, Instagram) are expensive → strict limits.
+# YouTube Data API is cheap (batch 50 IDs per request) → higher limit.
+PLATFORM_BATCH_LIMITS: dict[str, int] = {
+    "youtube": 200,
+    "tiktok": 20,
+    "instagram": 20,
+    "vk": 100,
+}
+# Apify platforms: only sync videos published within this window (hours).
+# Older videos get synced only once per day via the normal stale policy.
+APIFY_FRESH_ONLY_HOURS = 72
+
 
 def _ensure_utc(dt: datetime | None) -> datetime | None:
     """Guarantee a datetime is timezone-aware (UTC).
@@ -114,16 +128,50 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
         by_platform.setdefault(platform, []).append(task)
 
     synced = 0
-    errors = 0
+    platform_reports: dict[str, dict] = {}
+    is_apify = {"tiktok", "instagram"}
 
     for platform, platform_tasks in by_platform.items():
+        p_report: dict[str, Any] = {"total": len(platform_tasks), "synced": 0, "error": None, "capped": False}
         try:
             fetcher = _get_metrics_fetcher(platform)
             if not fetcher:
-                logger.debug(f"[sync_metrics] No fetcher for platform '{platform}', skipping {len(platform_tasks)} tasks")
+                logger.debug(f"[sync_metrics] No fetcher for '{platform}', skipping {len(platform_tasks)} tasks")
+                p_report["error"] = "no_fetcher"
+                platform_reports[platform] = p_report
                 continue
 
+            # ── Priority sort: freshest first ────────────────
+            platform_tasks.sort(
+                key=lambda t: _ensure_utc(t.published_at) or now,
+                reverse=True,  # newest first
+            )
+
+            # ── Apify platforms: prefer fresh window only ────
+            if platform in is_apify:
+                fresh_cutoff = now - timedelta(hours=APIFY_FRESH_ONLY_HOURS)
+                fresh = [t for t in platform_tasks if (_ensure_utc(t.published_at) or now) >= fresh_cutoff]
+                stale = [t for t in platform_tasks if (_ensure_utc(t.published_at) or now) < fresh_cutoff]
+                # Fresh videos get priority; stale only if budget remains
+                platform_tasks = fresh + stale
+
+            # ── Apply per-platform batch limit ───────────────
+            limit = PLATFORM_BATCH_LIMITS.get(platform, 50)
+            if len(platform_tasks) > limit:
+                logger.info(
+                    f"[sync_metrics] {platform}: capping {len(platform_tasks)} → {limit} "
+                    f"(budget limit, freshest first)"
+                )
+                platform_tasks = platform_tasks[:limit]
+                p_report["capped"] = True
+
+            p_report["fetching"] = len(platform_tasks)
+
+            # ── Fetch metrics from platform API ──────────────
             metrics_map = await fetcher(platform_tasks)
+
+            # ── Save snapshots ───────────────────────────────
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
 
             for task in platform_tasks:
                 ext_id = task.published_external_id
@@ -147,8 +195,6 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
                     candidate_id = cand_row[0]
 
                 # Upsert snapshot
-                from sqlalchemy.dialects.postgresql import insert as pg_insert
-
                 stmt = pg_insert(PublishedVideoMetrics).values(
                     task_id=task.id,
                     candidate_id=candidate_id,
@@ -183,20 +229,38 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
                 }
                 task.last_metrics_at = now
                 session.add(task)
+                p_report["synced"] += 1
                 synced += 1
 
             await session.commit()
 
         except Exception as e:
-            logger.error(f"[sync_metrics] Error syncing {platform}: {e}")
-            errors += 1
-            await session.rollback()
+            # Partial failure: this platform failed, others continue
+            logger.error(f"[sync_metrics] {platform} FAILED: {e}")
+            p_report["error"] = str(e)[:200]
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+
+        platform_reports[platform] = p_report
+
+    errors = sum(1 for r in platform_reports.values() if r.get("error"))
 
     logger.info(
         f"[sync_metrics] Done: {synced} synced, {skipped} skipped, "
-        f"{errors} errors, {len(tasks)} total tasks"
+        f"{errors} platform errors, {len(tasks)} total | "
+        + " | ".join(f"{p}: {r.get('synced', 0)}/{r.get('fetching', r.get('total', '?'))}"
+                      + (" ERR" if r.get("error") else "")
+                      for p, r in platform_reports.items())
     )
-    return {"synced": synced, "skipped": skipped, "errors": errors, "total": len(tasks)}
+    return {
+        "synced": synced,
+        "skipped": skipped,
+        "errors": errors,
+        "total": len(tasks),
+        "platforms": platform_reports,
+    }
 
 
 # ── Snapshot aggregation / cleanup ───────────────────────────
