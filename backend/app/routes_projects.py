@@ -1646,20 +1646,125 @@ async def enqueue_task(task_id: int, session: AsyncSession = SessionDep):
             detail="Celery is disabled (CELERY_ENABLED=false)",
         )
 
-    # Set status to queued so worker picks it up correctly
+    # Clear control flags + set status to queued
     task.status = "queued"
     task.publish_error = None
+    task.pause_requested_at = None
+    task.paused_at = None
+    task.pause_reason = None
+    task.cancel_requested_at = None
+    task.canceled_at = None
+    task.cancel_reason = None
     session.add(task)
     await session.commit()
 
     from app.worker.tasks import process_task as celery_process_task
     result = celery_process_task.apply_async(args=[task_id], queue="pipeline")
 
+    # Save celery_task_id
+    task.celery_task_id = result.id
+    session.add(task)
+    await session.commit()
+
     return {
         "enqueued": True,
         "task_id": task_id,
         "celery_task_id": result.id,
     }
+
+
+@router.post("/publish-tasks/{task_id}/pause", response_model=dict)
+async def pause_task(task_id: int, session: AsyncSession = SessionDep, reason: str | None = None):
+    """Request pause for a processing task (cooperative, between steps)."""
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    allowed = {"queued", "processing", "ready_for_review", "done"}
+    if task.status not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot pause task with status '{task.status}'",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # If not actively processing, pause immediately
+    if task.status in ("queued", "ready_for_review", "done"):
+        task.status = "paused"
+        task.paused_at = now
+    task.pause_requested_at = now
+    task.pause_reason = reason
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    return {"ok": True, "task_id": task_id, "status": task.status, "pause_requested_at": task.pause_requested_at.isoformat() if task.pause_requested_at else None}
+
+
+@router.post("/publish-tasks/{task_id}/resume", response_model=dict)
+async def resume_task(task_id: int, session: AsyncSession = SessionDep):
+    """Resume a paused task — re-enqueues to Celery."""
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    if task.status != "paused":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot resume task with status '{task.status}' (expected 'paused')",
+        )
+
+    # Clear pause flags, set back to queued
+    task.status = "queued"
+    task.pause_requested_at = None
+    task.paused_at = None
+    task.pause_reason = None
+    session.add(task)
+    await session.commit()
+
+    # Re-enqueue to Celery if enabled
+    from app.settings import get_settings
+    settings = get_settings()
+    celery_task_id = None
+    if settings.celery_enabled:
+        from app.worker.tasks import process_task as celery_process_task
+        result = celery_process_task.apply_async(args=[task_id], queue="pipeline")
+        celery_task_id = result.id
+        task.celery_task_id = celery_task_id
+        session.add(task)
+        await session.commit()
+
+    return {"ok": True, "task_id": task_id, "status": "queued", "celery_task_id": celery_task_id}
+
+
+@router.post("/publish-tasks/{task_id}/cancel", response_model=dict)
+async def cancel_task(task_id: int, session: AsyncSession = SessionDep, reason: str | None = None):
+    """Request cancellation for a task (cooperative, between steps)."""
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    if task.status in ("published", "canceled"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel task with status '{task.status}'",
+        )
+
+    now = datetime.now(timezone.utc)
+    task.cancel_requested_at = now
+    task.cancel_reason = reason
+
+    # If not actively processing, cancel immediately
+    if task.status in ("queued", "paused", "ready_for_review", "done", "error"):
+        task.status = "canceled"
+        task.canceled_at = now
+
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    return {"ok": True, "task_id": task_id, "status": task.status, "cancel_requested_at": task.cancel_requested_at.isoformat() if task.cancel_requested_at else None}
 
 
 @router.post("/publish-tasks/{task_id}/process-v2", response_model=dict)

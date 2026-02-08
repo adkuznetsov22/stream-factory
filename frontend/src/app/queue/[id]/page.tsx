@@ -361,6 +361,43 @@ export default function TaskDetailPage() {
     await fetchData();
   };
 
+  const handlePause = async () => {
+    if (!taskId) return;
+    setActionError(null);
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/pause`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Ошибка" }));
+      setActionError(typeof err.detail === "string" ? err.detail : "Не удалось поставить на паузу");
+      return;
+    }
+    await fetchData();
+  };
+
+  const handleResume = async () => {
+    if (!taskId) return;
+    setActionError(null);
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/resume`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Ошибка" }));
+      setActionError(typeof err.detail === "string" ? err.detail : "Не удалось возобновить");
+      return;
+    }
+    await fetchData();
+  };
+
+  const handleCancel = async () => {
+    if (!taskId) return;
+    if (!confirm("Отменить задачу? Это действие нельзя отменить.")) return;
+    setActionError(null);
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/cancel`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Ошибка" }));
+      setActionError(typeof err.detail === "string" ? err.detail : "Не удалось отменить");
+      return;
+    }
+    await fetchData();
+  };
+
   const handleRetryPublish = async (force = false) => {
     if (!taskId) return;
     setActionError(null);
@@ -442,6 +479,31 @@ export default function TaskDetailPage() {
               >
                 Ошибка
               </button>
+              {/* Task control: Pause / Resume / Cancel */}
+              {data && data.task.status !== "published" && data.task.status !== "canceled" && data.task.status !== "paused" && (
+                <button
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#fef3c7", color: "#92400e", fontWeight: 600, cursor: "pointer" }}
+                  onClick={handlePause}
+                >
+                  ⏸ Пауза
+                </button>
+              )}
+              {data && data.task.status === "paused" && (
+                <button
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#dbeafe", color: "#1e40af", fontWeight: 600, cursor: "pointer" }}
+                  onClick={handleResume}
+                >
+                  ▶ Возобновить
+                </button>
+              )}
+              {data && data.task.status !== "published" && data.task.status !== "canceled" && (
+                <button
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#991b1b", color: "#fff", fontWeight: 600, cursor: "pointer" }}
+                  onClick={handleCancel}
+                >
+                  ✕ Отмена
+                </button>
+              )}
             </div>
           </div>
           {actionError && <div style={{ color: "var(--error)", marginTop: 8 }}>{actionError}</div>}

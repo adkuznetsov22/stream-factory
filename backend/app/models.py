@@ -566,6 +566,14 @@ class PublishTask(Base):
     current_step_index: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="0")
     pipeline_status: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default="pending")
     total_steps: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="0")
+    # Task control
+    pause_requested_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    paused_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    pause_reason: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    cancel_reason: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    celery_task_id: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now(), nullable=False

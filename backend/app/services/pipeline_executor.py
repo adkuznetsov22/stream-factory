@@ -218,6 +218,19 @@ class PipelineExecutor:
                 results["steps"].append(step_result)
                 continue
             
+            # ── Check control flags before step ──────────────
+            if hasattr(self.context, 'session') and self.context.session and self.context.task_id:
+                from app.services.task_control import check_control_flags, TaskPaused, TaskCanceled
+                try:
+                    await check_control_flags(self.context.session, self.context.task_id)
+                except (TaskPaused, TaskCanceled) as ctrl:
+                    step_result["status"] = "canceled" if isinstance(ctrl, TaskCanceled) else "paused"
+                    step_result["error"] = str(ctrl)
+                    results["success"] = False
+                    results["error"] = str(ctrl)
+                    self.context.log(f"[{tool_id}] {ctrl}")
+                    break
+
             # Execute step
             step_result["status"] = "processing"
             step_result["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -260,6 +273,17 @@ class PipelineExecutor:
                 
                 results["steps_executed"] += 1
                 self.context.log(f"[{tool_id}] Completed in {duration_ms}ms")
+
+                # ── Check control flags after step ──────────────
+                if hasattr(self.context, 'session') and self.context.session and self.context.task_id:
+                    from app.services.task_control import check_control_flags, TaskPaused, TaskCanceled
+                    try:
+                        await check_control_flags(self.context.session, self.context.task_id)
+                    except (TaskPaused, TaskCanceled) as ctrl:
+                        results["success"] = False
+                        results["error"] = str(ctrl)
+                        self.context.log(f"[{tool_id}] Post-step: {ctrl}")
+                        break
                 
             except Exception as e:
                 duration_ms = int((datetime.now(timezone.utc) - t_start).total_seconds() * 1000)
