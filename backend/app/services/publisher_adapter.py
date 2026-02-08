@@ -11,6 +11,7 @@ from __future__ import annotations
 import abc
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,57 @@ def _is_retryable_error(error: str | None) -> bool:
         return False
     lower = error.lower()
     return any(ind in lower for ind in RETRYABLE_INDICATORS)
+
+
+# ── Credential sanitization ──────────────────────────────────
+
+# Patterns that match tokens/secrets in error strings and URLs
+_SENSITIVE_PATTERNS = [
+    # Bearer tokens
+    (re.compile(r"Bearer\s+[A-Za-z0-9\-_\.]+", re.IGNORECASE), "Bearer ***"),
+    # access_token in URLs/params
+    (re.compile(r"access_token=[A-Za-z0-9\-_\.%]+", re.IGNORECASE), "access_token=***"),
+    # refresh_token in URLs/params
+    (re.compile(r"refresh_token=[A-Za-z0-9\-_\.%]+", re.IGNORECASE), "refresh_token=***"),
+    # session_id / sessionid values
+    (re.compile(r"session[_]?[iI]d[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9\-_\.%]+", re.IGNORECASE), "session_id=***"),
+    # client_secret
+    (re.compile(r"client_secret=[A-Za-z0-9\-_\.%]+", re.IGNORECASE), "client_secret=***"),
+    # Generic long hex/base64 tokens (40+ chars)
+    (re.compile(r"[A-Za-z0-9\-_]{40,}"), "***TOKEN***"),
+]
+
+
+def _sanitize(text: str | None) -> str | None:
+    """Strip credentials and tokens from error messages / response text."""
+    if not text:
+        return text
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _sanitize_dict(d: dict | None) -> dict | None:
+    """Remove sensitive keys from a response dict before persisting."""
+    if not d:
+        return d
+    SENSITIVE_KEYS = {
+        "access_token", "refresh_token", "client_secret",
+        "session_id", "sessionid", "sessionId", "ds_user_id",
+        "cookie", "cookies", "authorization",
+    }
+    cleaned = {}
+    for k, v in d.items():
+        if k.lower() in {s.lower() for s in SENSITIVE_KEYS}:
+            cleaned[k] = "***"
+        elif isinstance(v, dict):
+            cleaned[k] = _sanitize_dict(v)
+        elif isinstance(v, str) and len(v) > 60:
+            # Possibly a token — truncate
+            cleaned[k] = v[:8] + "***"
+        else:
+            cleaned[k] = v
+    return cleaned
 
 
 @dataclass
@@ -133,7 +185,7 @@ class YouTubePublisher(PublisherAdapter):
                     refresh_token, client_id, client_secret
                 )
             except Exception as exc:
-                msg = f"Token refresh failed: {exc}"
+                msg = _sanitize(f"Token refresh failed: {exc}")
                 self._error(task.id, msg)
                 return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(str(exc)))
 
@@ -177,7 +229,7 @@ class YouTubePublisher(PublisherAdapter):
                     content=json.dumps(metadata),
                 )
                 if init_resp.status_code not in (200, 308):
-                    msg = f"YouTube init upload failed: {init_resp.status_code} — {init_resp.text[:500]}"
+                    msg = _sanitize(f"YouTube init upload failed: {init_resp.status_code} — {init_resp.text[:500]}")
                     self._error(task.id, msg)
                     return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
@@ -196,7 +248,7 @@ class YouTubePublisher(PublisherAdapter):
                     )
 
                 if upload_resp.status_code not in (200, 201):
-                    msg = f"YouTube upload failed: {upload_resp.status_code} — {upload_resp.text[:500]}"
+                    msg = _sanitize(f"YouTube upload failed: {upload_resp.status_code} — {upload_resp.text[:500]}")
                     self._error(task.id, msg)
                     return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
@@ -210,11 +262,11 @@ class YouTubePublisher(PublisherAdapter):
                     external_id=video_id,
                     url=url,
                     platform=self.platform,
-                    raw_response=data,
+                    raw_response=_sanitize_dict(data),
                 )
 
         except Exception as exc:
-            msg = f"YouTube publish error: {exc}"
+            msg = _sanitize(f"YouTube publish error: {exc}")
             self._error(task.id, msg)
             return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
@@ -232,7 +284,7 @@ class YouTubePublisher(PublisherAdapter):
                 },
             )
             if resp.status_code != 200:
-                raise RuntimeError(f"Token refresh HTTP {resp.status_code}: {resp.text[:300]}")
+                raise RuntimeError(_sanitize(f"Token refresh HTTP {resp.status_code}: {resp.text[:300]}"))
             return resp.json()["access_token"]
 
 
@@ -301,21 +353,21 @@ class TikTokPublisher(PublisherAdapter):
                     external_id=video_id,
                     url=url,
                     platform=self.platform,
-                    raw_response={"items": items, "meta": meta},
+                    raw_response=_sanitize_dict({"items": items, "meta": meta}),
                 )
 
-            msg = f"Apify run completed but no videoId in response: {items[:1] if items else 'empty'}"
+            msg = _sanitize(f"Apify run completed but no videoId in response: {items[:1] if items else 'empty'}")
             self._error(task.id, msg)
             return PublishResult(
                 success=False,
                 platform=self.platform,
                 error=msg,
                 retryable=True,
-                raw_response={"items": items, "meta": meta},
+                raw_response=_sanitize_dict({"items": items, "meta": meta}),
             )
 
         except Exception as exc:
-            msg = f"TikTok publish error: {exc}"
+            msg = _sanitize(f"TikTok publish error: {exc}")
             self._error(task.id, msg)
             return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
@@ -383,21 +435,21 @@ class InstagramPublisher(PublisherAdapter):
                     external_id=media_id,
                     url=url,
                     platform=self.platform,
-                    raw_response={"items": items, "meta": meta},
+                    raw_response=_sanitize_dict({"items": items, "meta": meta}),
                 )
 
-            msg = f"Apify run completed but no mediaId in response: {items[:1] if items else 'empty'}"
+            msg = _sanitize(f"Apify run completed but no mediaId in response: {items[:1] if items else 'empty'}")
             self._error(task.id, msg)
             return PublishResult(
                 success=False,
                 platform=self.platform,
                 error=msg,
                 retryable=True,
-                raw_response={"items": items, "meta": meta},
+                raw_response=_sanitize_dict({"items": items, "meta": meta}),
             )
 
         except Exception as exc:
-            msg = f"Instagram publish error: {exc}"
+            msg = _sanitize(f"Instagram publish error: {exc}")
             self._error(task.id, msg)
             return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
@@ -458,7 +510,7 @@ class VKPublisher(PublisherAdapter):
                 )
                 save_data = save_resp.json()
                 if "error" in save_data:
-                    msg = f"VK video.save error: {save_data['error'].get('error_msg', save_data['error'])}"
+                    msg = _sanitize(f"VK video.save error: {save_data['error'].get('error_msg', save_data['error'])}")
                     self._error(task.id, msg)
                     return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
@@ -482,7 +534,7 @@ class VKPublisher(PublisherAdapter):
 
                 upload_data = upload_resp.json()
                 if upload_data.get("error"):
-                    msg = f"VK upload error: {upload_data}"
+                    msg = _sanitize(f"VK upload error: {upload_data}")
                     self._error(task.id, msg)
                     return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
@@ -497,11 +549,11 @@ class VKPublisher(PublisherAdapter):
                     external_id=f"{oid}_{vid}" if oid and vid else str(vid),
                     url=url,
                     platform=self.platform,
-                    raw_response={"save": response, "upload": upload_data},
+                    raw_response=_sanitize_dict({"save": response, "upload": upload_data}),
                 )
 
         except Exception as exc:
-            msg = f"VK publish error: {exc}"
+            msg = _sanitize(f"VK publish error: {exc}")
             self._error(task.id, msg)
             return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
