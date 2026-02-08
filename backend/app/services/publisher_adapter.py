@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 
 # ── Result dataclass ─────────────────────────────────────────
 
+# Ошибки, которые считаются retryable (сетевые, rate-limit, временные)
+RETRYABLE_INDICATORS = (
+    "timeout", "timed out", "429", "too many requests",
+    "502", "503", "504", "connection", "reset by peer",
+    "temporary", "service unavailable", "rate limit",
+    "network", "ssl", "eof", "broken pipe",
+)
+
+
+def _is_retryable_error(error: str | None) -> bool:
+    """Determine if an error message indicates a retryable failure."""
+    if not error:
+        return False
+    lower = error.lower()
+    return any(ind in lower for ind in RETRYABLE_INDICATORS)
+
+
 @dataclass
 class PublishResult:
     """Unified result of a publish attempt."""
@@ -33,6 +50,7 @@ class PublishResult:
     url: str | None = None
     platform: str | None = None
     error: str | None = None
+    retryable: bool = False
     raw_response: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -42,6 +60,7 @@ class PublishResult:
             "url": self.url,
             "platform": self.platform,
             "error": self.error,
+            "retryable": self.retryable,
         }
 
 
@@ -105,7 +124,7 @@ class YouTubePublisher(PublisherAdapter):
         if not access_token and not refresh_token:
             msg = "YouTube OAuth2 credentials missing (access_token / refresh_token)"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
         # Refresh token if needed
         if refresh_token and client_id and client_secret:
@@ -116,12 +135,12 @@ class YouTubePublisher(PublisherAdapter):
             except Exception as exc:
                 msg = f"Token refresh failed: {exc}"
                 self._error(task.id, msg)
-                return PublishResult(success=False, platform=self.platform, error=msg)
+                return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(str(exc)))
 
         if not access_token:
             msg = "No valid access_token after refresh attempt"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
         try:
             self._log(task.id, f"Uploading {file_path.name} ({file_path.stat().st_size} bytes)")
@@ -160,13 +179,13 @@ class YouTubePublisher(PublisherAdapter):
                 if init_resp.status_code not in (200, 308):
                     msg = f"YouTube init upload failed: {init_resp.status_code} — {init_resp.text[:500]}"
                     self._error(task.id, msg)
-                    return PublishResult(success=False, platform=self.platform, error=msg)
+                    return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
                 upload_url = init_resp.headers.get("location")
                 if not upload_url:
                     msg = "YouTube did not return upload URL"
                     self._error(task.id, msg)
-                    return PublishResult(success=False, platform=self.platform, error=msg)
+                    return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
                 # Step 2: upload file
                 with open(file_path, "rb") as f:
@@ -179,7 +198,7 @@ class YouTubePublisher(PublisherAdapter):
                 if upload_resp.status_code not in (200, 201):
                     msg = f"YouTube upload failed: {upload_resp.status_code} — {upload_resp.text[:500]}"
                     self._error(task.id, msg)
-                    return PublishResult(success=False, platform=self.platform, error=msg)
+                    return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
                 data = upload_resp.json()
                 video_id = data.get("id")
@@ -197,7 +216,7 @@ class YouTubePublisher(PublisherAdapter):
         except Exception as exc:
             msg = f"YouTube publish error: {exc}"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
     async def _refresh_access_token(
         self, refresh_token: str, client_id: str, client_secret: str
@@ -242,14 +261,14 @@ class TikTokPublisher(PublisherAdapter):
         if not settings.apify_token:
             msg = "APIFY_TOKEN not configured — cannot publish to TikTok"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
         creds = (account.credentials_json or {}) if hasattr(account, "credentials_json") else {}
         session_id = creds.get("session_id") or creds.get("sessionid")
         if not session_id:
             msg = "TikTok session_id missing in account credentials"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
         try:
             from app.integrations.apify_client import run_actor_and_get_dataset_items
@@ -291,13 +310,14 @@ class TikTokPublisher(PublisherAdapter):
                 success=False,
                 platform=self.platform,
                 error=msg,
+                retryable=True,
                 raw_response={"items": items, "meta": meta},
             )
 
         except Exception as exc:
             msg = f"TikTok publish error: {exc}"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
 
 # ── Instagram Reels (via Apify) ──────────────────────────────
@@ -324,14 +344,14 @@ class InstagramPublisher(PublisherAdapter):
         if not settings.apify_token:
             msg = "APIFY_TOKEN not configured — cannot publish to Instagram"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
         creds = (account.credentials_json or {}) if hasattr(account, "credentials_json") else {}
         session_id = creds.get("session_id") or creds.get("sessionid") or creds.get("ds_user_id")
         if not session_id:
             msg = "Instagram session credentials missing in account"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
         try:
             from app.integrations.apify_client import run_actor_and_get_dataset_items
@@ -372,13 +392,14 @@ class InstagramPublisher(PublisherAdapter):
                 success=False,
                 platform=self.platform,
                 error=msg,
+                retryable=True,
                 raw_response={"items": items, "meta": meta},
             )
 
         except Exception as exc:
             msg = f"Instagram publish error: {exc}"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
 
 # ── VK Clips ──────────────────────────────────────────────────
@@ -405,7 +426,7 @@ class VKPublisher(PublisherAdapter):
         if not settings.vk_access_token:
             msg = "VK_ACCESS_TOKEN not configured — cannot publish to VK"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
         try:
             # Determine owner_id for group or user
@@ -439,7 +460,7 @@ class VKPublisher(PublisherAdapter):
                 if "error" in save_data:
                     msg = f"VK video.save error: {save_data['error'].get('error_msg', save_data['error'])}"
                     self._error(task.id, msg)
-                    return PublishResult(success=False, platform=self.platform, error=msg)
+                    return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
                 response = save_data.get("response", {})
                 upload_url = response.get("upload_url")
@@ -449,7 +470,7 @@ class VKPublisher(PublisherAdapter):
                 if not upload_url:
                     msg = "VK video.save did not return upload_url"
                     self._error(task.id, msg)
-                    return PublishResult(success=False, platform=self.platform, error=msg)
+                    return PublishResult(success=False, platform=self.platform, error=msg, retryable=False)
 
                 # Step 2: upload video file
                 self._log(task.id, f"Uploading {file_path.name} to VK ({file_path.stat().st_size} bytes)")
@@ -463,7 +484,7 @@ class VKPublisher(PublisherAdapter):
                 if upload_data.get("error"):
                     msg = f"VK upload error: {upload_data}"
                     self._error(task.id, msg)
-                    return PublishResult(success=False, platform=self.platform, error=msg)
+                    return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
                 # Build URL
                 vid = video_id or upload_data.get("video_id")
@@ -482,7 +503,7 @@ class VKPublisher(PublisherAdapter):
         except Exception as exc:
             msg = f"VK publish error: {exc}"
             self._error(task.id, msg)
-            return PublishResult(success=False, platform=self.platform, error=msg)
+            return PublishResult(success=False, platform=self.platform, error=msg, retryable=_is_retryable_error(msg))
 
 
 # ── Registry ──────────────────────────────────────────────────

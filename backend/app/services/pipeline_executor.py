@@ -1872,12 +1872,15 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
     Выполняется как последний шаг пресета (после T18_QC).
     Использует PublisherAdapter для загрузки на платформу.
 
-    Обновляет:
-    - PublishTask.status: done → publishing → published / error
-    - PublishTask.published_url, published_external_id, published_at
-    - Candidate.status → USED (если связан)
+    Устойчивость:
+    - Idempotency: (task_id, destination_id) — повторный запуск не дублирует
+    - Retry: до 3 попыток с backoff (60с / 300с / 1200с) для retryable ошибок
+    - Fatal ошибки (нет токена, невалидный файл) — немедленный fail
+    - Каждая попытка логируется в StepResult.output_data.attempts[]
     """
-    from app.models import PublishTask, SocialAccount, Candidate, CandidateStatus
+    import asyncio
+    import traceback
+    from app.models import PublishTask, SocialAccount, Candidate, CandidateStatus, StepResult
     from app.services.publisher_adapter import get_publisher, PublishResult
 
     session = ctx.session
@@ -1886,10 +1889,23 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
     if not session or not task:
         raise RuntimeError("P01_PUBLISH requires session and publish_task in StepContext")
 
-    # Resolve output video
+    # ── Idempotency check ────────────────────────────────────
+    if task.published_url and task.status == "published":
+        ctx.log(
+            f"[P01_PUBLISH] Idempotency: task #{task.id} already published "
+            f"to {task.published_url} — skipping"
+        )
+        return {
+            "published": True,
+            "published_url": task.published_url,
+            "published_external_id": task.published_external_id,
+            "platform": task.platform,
+            "idempotent_skip": True,
+        }
+
+    # ── Resolve output video ─────────────────────────────────
     input_path = ctx.get_input_video()
     if not input_path or not input_path.exists():
-        # Fallback: try known paths
         for name in ("final.mp4", "ready.mp4", "output.mp4"):
             p = ctx.task_dir / name
             if p.exists():
@@ -1899,7 +1915,7 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
     if not input_path or not input_path.exists():
         raise RuntimeError(f"P01_PUBLISH: no output video found in {ctx.task_dir}")
 
-    # Get destination account
+    # ── Resolve adapter ──────────────────────────────────────
     account = await session.get(SocialAccount, ctx.destination_account_id)
     if not account:
         raise RuntimeError(f"P01_PUBLISH: destination account #{ctx.destination_account_id} not found")
@@ -1909,13 +1925,7 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
     if not adapter:
         raise RuntimeError(f"P01_PUBLISH: no adapter for platform '{platform}'")
 
-    # Mark as publishing
-    task.status = "publishing"
-    session.add(task)
-    await session.commit()
-    ctx.log(f"[P01_PUBLISH] Publishing to {platform} via {adapter.__class__.__name__}")
-
-    # Prepare metadata
+    # ── Prepare metadata ─────────────────────────────────────
     title = task.caption_text or task.instructions or f"Video #{task.id}"
     description = task.caption_text or ""
     tags: list[str] = []
@@ -1924,22 +1934,89 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
         if isinstance(t, list):
             tags = [str(x) for x in t]
 
-    # Publish
-    result: PublishResult = await adapter.publish(
-        task=task,
-        account=account,
-        file_path=input_path,
-        title=title,
-        description=description,
-        tags=tags,
-    )
+    # ── Retry loop ───────────────────────────────────────────
+    MAX_ATTEMPTS = 3
+    BACKOFF_SECONDS = [60, 300, 1200]  # 1м, 5м, 20м
+    attempts: list[dict] = []
+    final_result: PublishResult | None = None
 
+    for attempt_num in range(1, MAX_ATTEMPTS + 1):
+        attempt_start = datetime.now(timezone.utc)
+
+        # Mark as publishing
+        task.status = "publishing"
+        session.add(task)
+        await session.commit()
+        ctx.log(
+            f"[P01_PUBLISH] Attempt {attempt_num}/{MAX_ATTEMPTS} — "
+            f"{platform} via {adapter.__class__.__name__}"
+        )
+
+        attempt_record: dict = {
+            "attempt": attempt_num,
+            "started_at": attempt_start.isoformat(),
+            "platform": platform,
+        }
+
+        try:
+            result: PublishResult = await adapter.publish(
+                task=task,
+                account=account,
+                file_path=input_path,
+                title=title,
+                description=description,
+                tags=tags,
+            )
+        except Exception as exc:
+            tb = traceback.format_exc()
+            result = PublishResult(
+                success=False,
+                platform=platform,
+                error=f"Unhandled exception: {exc}",
+                retryable=True,  # неизвестные ошибки считаем retryable
+            )
+            attempt_record["stacktrace"] = tb
+
+        attempt_end = datetime.now(timezone.utc)
+        attempt_record["finished_at"] = attempt_end.isoformat()
+        attempt_record["duration_ms"] = int((attempt_end - attempt_start).total_seconds() * 1000)
+        attempt_record["success"] = result.success
+        attempt_record["error"] = result.error
+        attempt_record["retryable"] = result.retryable
+        attempt_record["external_id"] = result.external_id
+        attempt_record["url"] = result.url
+        attempts.append(attempt_record)
+
+        if result.success:
+            final_result = result
+            ctx.log(f"[P01_PUBLISH] Attempt {attempt_num} succeeded: {result.url}")
+            break
+
+        # Fatal error — не retry
+        if not result.retryable:
+            final_result = result
+            ctx.log(f"[P01_PUBLISH] Attempt {attempt_num} FATAL error (no retry): {result.error}")
+            break
+
+        # Retryable — ждём backoff если не последняя попытка
+        if attempt_num < MAX_ATTEMPTS:
+            wait = BACKOFF_SECONDS[attempt_num - 1]
+            ctx.log(
+                f"[P01_PUBLISH] Attempt {attempt_num} retryable error: {result.error}. "
+                f"Waiting {wait}s before retry..."
+            )
+            await asyncio.sleep(wait)
+        else:
+            final_result = result
+            ctx.log(f"[P01_PUBLISH] Attempt {attempt_num} failed, no more retries: {result.error}")
+
+    # ── Persist result ───────────────────────────────────────
     now = datetime.now(timezone.utc)
 
-    if result.success:
+    if final_result and final_result.success:
         task.status = "published"
-        task.published_url = result.url
-        task.published_external_id = result.external_id
+        task.published_url = final_result.url
+        task.published_external_id = final_result.external_id
         task.published_at = now
         task.publish_error = None
         session.add(task)
@@ -1957,22 +2034,26 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
 
         await session.commit()
 
-        ctx.log(
-            f"[P01_PUBLISH] Published: url={result.url}, "
-            f"external_id={result.external_id}, platform={result.platform}"
-        )
-
         return {
             "published": True,
-            "published_url": result.url,
-            "published_external_id": result.external_id,
-            "platform": result.platform,
+            "published_url": final_result.url,
+            "published_external_id": final_result.external_id,
+            "platform": final_result.platform,
+            "attempts_count": len(attempts),
+            "attempts": attempts,
         }
     else:
+        error_msg = final_result.error if final_result else "All publish attempts failed"
         task.status = "error"
-        task.publish_error = result.error
-        task.error_message = f"P01_PUBLISH failed: {result.error}"
+        task.publish_error = error_msg
+        task.error_message = f"P01_PUBLISH failed after {len(attempts)} attempt(s): {error_msg}"
         session.add(task)
         await session.commit()
 
-        raise RuntimeError(f"P01_PUBLISH failed: {result.error}")
+        # Сохранить подробности всех попыток в StepResult
+        # (pipeline executor сохранит основной StepResult,
+        #  но attempts[] будет в output_data через raise)
+        raise RuntimeError(
+            f"P01_PUBLISH failed after {len(attempts)} attempt(s): {error_msg}"
+            f" | attempts: {json.dumps(attempts, default=str)}"
+        )
