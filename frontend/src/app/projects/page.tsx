@@ -15,6 +15,10 @@ type FeedSettings = {
   cooldown_hours_per_source?: number;
   min_score_override?: number | null;
   origin_filter?: string;
+  diversity_enabled?: boolean;
+  max_per_author_per_day?: number;
+  max_per_topic_per_day?: number;
+  max_same_topic_in_single_run?: number;
 };
 
 type AutoApproveReport = {
@@ -22,7 +26,8 @@ type AutoApproveReport = {
   approved_count: number;
   skipped_count: number;
   approved: { candidate_id: number; task_id: number | null; score: number; title?: string; destination_platform?: string; dry_run?: boolean }[];
-  skipped: { candidate_id: number; score: number; reason: string }[];
+  skipped: { candidate_id: number; score: number; reason: string; author_key?: string; topic_signature?: string }[];
+  skipped_reasons_breakdown?: Record<string, number>;
   daily_limits?: Record<string, { platform: string; used: number; limit: number }>;
   run_at?: string;
   error?: string;
@@ -75,6 +80,10 @@ function AutoApproveBlock({
   const cooldown = fs.cooldown_hours_per_source ?? 12;
   const scoreOverride = fs.min_score_override ?? null;
   const originFilter = fs.origin_filter ?? "ALL";
+  const divEnabled = fs.diversity_enabled ?? true;
+  const maxAuthor = fs.max_per_author_per_day ?? 2;
+  const maxTopic = fs.max_per_topic_per_day ?? 2;
+  const maxTopicRun = fs.max_same_topic_in_single_run ?? 1;
 
   const set = (patch: Partial<FeedSettings>) => onUpdate({ ...fs, ...patch });
 
@@ -149,6 +158,36 @@ function AutoApproveBlock({
               </div>
             </div>
 
+            {/* Diversity Guard */}
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, padding: "10px 12px", background: "var(--bg-subtle)", borderRadius: 8, border: "1px solid var(--border)" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flex: "0 0 auto" }}>
+                <input type="checkbox" checked={divEnabled} onChange={e => set({ diversity_enabled: e.target.checked })} />
+                <span style={{ fontSize: 12, fontWeight: 500 }}>Diversity Guard</span>
+              </label>
+              {divEnabled && (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <label style={{ fontSize: 11, color: "var(--fg-subtle)", whiteSpace: "nowrap" }}>автор/день</label>
+                    <input type="number" min={1} max={20} value={maxAuthor}
+                      onChange={e => set({ max_per_author_per_day: Number(e.target.value) || 2 })}
+                      style={{ width: 50 }} />
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <label style={{ fontSize: 11, color: "var(--fg-subtle)", whiteSpace: "nowrap" }}>тема/день</label>
+                    <input type="number" min={1} max={20} value={maxTopic}
+                      onChange={e => set({ max_per_topic_per_day: Number(e.target.value) || 2 })}
+                      style={{ width: 50 }} />
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <label style={{ fontSize: 11, color: "var(--fg-subtle)", whiteSpace: "nowrap" }}>тема/run</label>
+                    <input type="number" min={1} max={10} value={maxTopicRun}
+                      onChange={e => set({ max_same_topic_in_single_run: Number(e.target.value) || 1 })}
+                      style={{ width: 50 }} />
+                  </div>
+                </>
+              )}
+            </div>
+
             {/* Run buttons */}
             <div style={{ display: "flex", gap: 8 }}>
               <button
@@ -202,6 +241,16 @@ function AutoApproveBlock({
                         <span style={{ color: "var(--fg-subtle)" }}>score={a.score?.toFixed(2)}</span>
                         {a.destination_platform && <span style={{ color: "var(--fg-subtle)" }}>→ {a.destination_platform}</span>}
                       </div>
+                    ))}
+                  </div>
+                )}
+                {/* Reasons breakdown */}
+                {report.skipped_reasons_breakdown && Object.keys(report.skipped_reasons_breakdown).length > 0 && (
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                    {Object.entries(report.skipped_reasons_breakdown).map(([k, v]) => (
+                      <span key={k} style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "var(--bg-hover)", color: "var(--fg-subtle)" }}>
+                        {k}: {v}
+                      </span>
                     ))}
                   </div>
                 )}

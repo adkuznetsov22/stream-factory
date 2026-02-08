@@ -34,6 +34,12 @@ MAX_CANDIDATES_PER_RUN = 100
 VALID_ORIGIN_FILTERS = {"ALL", "REPURPOSE", "GENERATE"}
 
 
+# Diversity defaults
+DEFAULT_MAX_PER_AUTHOR_PER_DAY = 2
+DEFAULT_MAX_PER_TOPIC_PER_DAY = 2
+DEFAULT_MAX_SAME_TOPIC_IN_SINGLE_RUN = 1
+
+
 def _get_feed_settings(project: Project) -> dict:
     """Extract feed_settings with defaults."""
     fs = project.feed_settings or {}
@@ -43,6 +49,11 @@ def _get_feed_settings(project: Project) -> dict:
         "cooldown_hours_per_source": fs.get("cooldown_hours_per_source", DEFAULT_COOLDOWN_HOURS),
         "min_score_override": fs.get("min_score_override"),
         "origin_filter": fs.get("origin_filter", "ALL"),
+        # Diversity guard
+        "diversity_enabled": fs.get("diversity_enabled", True),
+        "max_per_author_per_day": fs.get("max_per_author_per_day", DEFAULT_MAX_PER_AUTHOR_PER_DAY),
+        "max_per_topic_per_day": fs.get("max_per_topic_per_day", DEFAULT_MAX_PER_TOPIC_PER_DAY),
+        "max_same_topic_in_single_run": fs.get("max_same_topic_in_single_run", DEFAULT_MAX_SAME_TOPIC_IN_SINGLE_RUN),
     }
 
 
@@ -115,6 +126,12 @@ async def run_auto_approve(
     if origin_filter not in VALID_ORIGIN_FILTERS:
         origin_filter = "ALL"
 
+    # Diversity settings
+    diversity_enabled = settings.get("diversity_enabled", True)
+    max_per_author = settings.get("max_per_author_per_day", DEFAULT_MAX_PER_AUTHOR_PER_DAY)
+    max_per_topic = settings.get("max_per_topic_per_day", DEFAULT_MAX_PER_TOPIC_PER_DAY)
+    max_topic_run = settings.get("max_same_topic_in_single_run", DEFAULT_MAX_SAME_TOPIC_IN_SINGLE_RUN)
+
     active_dests = [d for d in project.destinations if d.is_active]
     if not active_dests:
         return {
@@ -123,8 +140,16 @@ async def run_auto_approve(
             "threshold": threshold, "dry_run": dry_run,
         }
 
-    # ── Count today's tasks per destination (calendar day UTC) ─
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # ── Timezone for "today" ───────────────────────────────────
+    ps = (project.meta or {}).get("publish_settings", {})
+    tz_name = ps.get("timezone") or "UTC"
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    local_now = now.astimezone(tz)
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     daily_counts: dict[int, int] = {}
     for dest in active_dests:
         count_q = await session.execute(
@@ -159,6 +184,32 @@ async def run_auto_approve(
                 cooldown_keys.add(f"author:{author}")
             elif url:
                 cooldown_keys.add(f"url:{url}")
+
+    # ── Diversity: today counts per author and topic ──────────
+    author_today: dict[str, int] = {}
+    topic_today: dict[str, int] = {}
+    topic_run: dict[str, int] = {}  # per-run counter
+
+    if diversity_enabled:
+        today_cands_q = await session.execute(
+            select(Candidate.author, Candidate.url, Candidate.origin, Candidate.meta).where(and_(
+                Candidate.project_id == project_id,
+                Candidate.status.in_([CandidateStatus.approved.value, "used"]),
+                Candidate.reviewed_at >= day_start,
+            ))
+        )
+        for row in today_cands_q.all():
+            c_author, c_url, c_origin, c_meta = row
+            # Author key
+            if c_origin != CandidateOrigin.generate.value:
+                akey = c_author or c_url or ""
+                if akey:
+                    author_today[akey] = author_today.get(akey, 0) + 1
+            # Topic key
+            c_meta = c_meta or {}
+            tsig = c_meta.get("topic_signature", "")
+            if tsig:
+                topic_today[tsig] = topic_today.get(tsig, 0) + 1
 
     # ── Fetch eligible candidates ────────────────────────────
     filters = [
@@ -228,6 +279,42 @@ async def run_auto_approve(
             })
             continue
 
+        # ── Diversity guard ──────────────────────────────
+        if diversity_enabled:
+            # Author cap
+            if candidate.origin != CandidateOrigin.generate.value:
+                akey = candidate.author or candidate.url or ""
+                if akey and author_today.get(akey, 0) >= max_per_author:
+                    skipped.append({
+                        "candidate_id": candidate.id,
+                        "score": candidate.virality_score,
+                        "reason": f"author_cap: '{akey}' {author_today[akey]}/{max_per_author}",
+                        "author_key": akey,
+                    })
+                    continue
+
+            # Topic cap (daily)
+            from app.services.topic_guard import ensure_candidate_topic_meta
+            _, tsig = ensure_candidate_topic_meta(candidate)
+            if tsig and topic_today.get(tsig, 0) >= max_per_topic:
+                skipped.append({
+                    "candidate_id": candidate.id,
+                    "score": candidate.virality_score,
+                    "reason": f"topic_cap: sig={tsig[:12]}… {topic_today[tsig]}/{max_per_topic}",
+                    "topic_signature": tsig,
+                })
+                continue
+
+            # Topic cap (per-run)
+            if tsig and topic_run.get(tsig, 0) >= max_topic_run:
+                skipped.append({
+                    "candidate_id": candidate.id,
+                    "score": candidate.virality_score,
+                    "reason": f"topic_run_cap: sig={tsig[:12]}… {topic_run[tsig]}/{max_topic_run}",
+                    "topic_signature": tsig,
+                })
+                continue
+
         # ── Find best destination with remaining budget ──
         best_dest = None
         for dest in active_dests:
@@ -257,6 +344,16 @@ async def run_auto_approve(
             daily_counts[best_dest.id] = daily_counts.get(best_dest.id, 0) + 1
             if ck:
                 cooldown_keys.add(ck)
+            # Update diversity counters for dry_run too
+            if diversity_enabled:
+                if candidate.origin != CandidateOrigin.generate.value:
+                    akey = candidate.author or candidate.url or ""
+                    if akey:
+                        author_today[akey] = author_today.get(akey, 0) + 1
+                _tsig = (candidate.meta or {}).get("topic_signature", "")
+                if _tsig:
+                    topic_today[_tsig] = topic_today.get(_tsig, 0) + 1
+                    topic_run[_tsig] = topic_run.get(_tsig, 0) + 1
             continue
 
         # ── Create PublishTask (same flow as manual approve) ─
@@ -308,6 +405,16 @@ async def run_auto_approve(
         daily_counts[best_dest.id] = daily_counts.get(best_dest.id, 0) + 1
         if ck:
             cooldown_keys.add(ck)
+        # Update diversity counters
+        if diversity_enabled:
+            if candidate.origin != CandidateOrigin.generate.value:
+                akey = candidate.author or candidate.url or ""
+                if akey:
+                    author_today[akey] = author_today.get(akey, 0) + 1
+            _tsig = (candidate.meta or {}).get("topic_signature", "")
+            if _tsig:
+                topic_today[_tsig] = topic_today.get(_tsig, 0) + 1
+                topic_run[_tsig] = topic_run.get(_tsig, 0) + 1
 
         approved.append({
             "candidate_id": candidate.id,
@@ -318,6 +425,12 @@ async def run_auto_approve(
             "title": candidate.title,
         })
 
+    # ── Build skipped_reasons_breakdown ────────────────────────
+    reasons_breakdown: dict[str, int] = {}
+    for s in skipped:
+        reason_key = s["reason"].split(":")[0]  # e.g. "author_cap", "topic_cap", etc.
+        reasons_breakdown[reason_key] = reasons_breakdown.get(reason_key, 0) + 1
+
     report = {
         "project_id": project_id,
         "threshold": round(threshold, 4),
@@ -325,6 +438,7 @@ async def run_auto_approve(
         "skipped_count": len(skipped),
         "approved": approved,
         "skipped": skipped,
+        "skipped_reasons_breakdown": reasons_breakdown,
         "daily_limits": {
             dest.id: {"platform": dest.platform, "used": daily_counts.get(dest.id, 0), "limit": daily_limit}
             for dest in active_dests
