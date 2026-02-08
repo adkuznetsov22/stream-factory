@@ -9,7 +9,9 @@ from sqlalchemy.orm import selectinload
 
 from app.db import get_session
 from app.models import (
+    Brief,
     Candidate,
+    CandidateOrigin,
     CandidateStatus,
     InstagramPost,
     InstagramProfile,
@@ -164,19 +166,41 @@ async def approve_candidate(
     if not dest:
         raise HTTPException(status_code=400, detail="No active destination found")
 
+    # For GENERATE candidates, load brief data into task metadata
+    is_generate = candidate.origin == CandidateOrigin.generate.value
+    task_meta = None
+    if is_generate:
+        brief = await session.get(Brief, candidate.brief_id) if candidate.brief_id else None
+        task_meta = {
+            "origin": "GENERATE",
+            "candidate_meta": candidate.meta or {},
+            "brief": {
+                "id": brief.id,
+                "title": brief.title,
+                "topic": brief.topic,
+                "style": brief.style,
+                "tone": brief.tone,
+                "language": brief.language,
+                "target_duration_sec": brief.target_duration_sec,
+                "target_platform": brief.target_platform,
+                "llm_prompt_template": brief.llm_prompt_template,
+            } if brief else {},
+        }
+
     # Create PublishTask
     task = PublishTask(
         project_id=project_id,
         platform=dest.platform,
         destination_social_account_id=dest.social_account_id,
         external_id=candidate.platform_video_id,
-        permalink=candidate.url,
+        permalink=candidate.url if not is_generate else None,
         preview_url=candidate.thumbnail_url,
-        download_url=candidate.url,
+        download_url=candidate.url if not is_generate else None,
         caption_text=candidate.caption or candidate.title,
         status="queued",
         preset_id=project.preset_id,
         total_steps=0,
+        artifacts=task_meta,
     )
     session.add(task)
     await session.flush()  # get task.id

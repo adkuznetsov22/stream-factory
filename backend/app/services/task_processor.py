@@ -87,6 +87,11 @@ class TaskProcessor:
         ctx.permalink = task.permalink
         ctx.caption_text = task.caption_text or task.instructions
         
+        # Populate GENERATE context from task artifacts
+        if task.artifacts and isinstance(task.artifacts, dict) and task.artifacts.get("origin") == "GENERATE":
+            ctx.candidate_meta = task.artifacts.get("candidate_meta", {})
+            ctx.brief_data = task.artifacts.get("brief", {})
+        
         # Build step list
         steps = self._build_steps(preset, task)
         

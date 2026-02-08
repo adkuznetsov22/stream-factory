@@ -52,6 +52,10 @@ class StepContext:
         self.download_url: str | None = None
         self.permalink: str | None = None
         
+        # Generation metadata (for GENERATE origin candidates)
+        self.candidate_meta: dict = {}
+        self.brief_data: dict = {}
+        
         # Step outputs accumulator
         self.outputs: dict[str, Any] = {}
     
@@ -1400,3 +1404,267 @@ def _format_ass_time(seconds: float) -> str:
     secs = int(seconds % 60)
     centis = int((seconds % 1) * 100)
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+# ============== Generation Pipeline Tools (G-series) ==============
+
+@PipelineExecutor.register("G01_SCRIPT")
+async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
+    """Generate video script from candidate meta / brief data.
+
+    Reads candidate_meta (hook, script, keywords) or brief_data (topic, style)
+    and produces a structured script JSON saved to task folder.
+    """
+    meta = ctx.candidate_meta or {}
+    brief = ctx.brief_data or {}
+
+    # Gather inputs
+    hook = meta.get("hook") or params.get("hook", "")
+    existing_script = meta.get("script") or params.get("script", "")
+    topic = brief.get("topic") or meta.get("topic") or params.get("topic", "Untitled")
+    style = brief.get("style") or params.get("style", "educational")
+    tone = brief.get("tone") or params.get("tone", "casual")
+    target_duration = (
+        brief.get("target_duration_sec")
+        or params.get("target_duration_sec", 60)
+    )
+    keywords = meta.get("keywords") or params.get("keywords", [])
+    language = brief.get("language") or params.get("language", "ru")
+
+    # Build structured script
+    segments = []
+    dur = int(target_duration)
+
+    # Intro segment
+    segments.append({
+        "index": 0,
+        "type": "hook",
+        "start_sec": 0,
+        "end_sec": min(3, dur),
+        "text": hook or f"Привет! Сегодня поговорим о {topic}",
+        "notes": "attention-grabbing opening",
+    })
+
+    # Main body segments (split evenly)
+    body_start = min(3, dur)
+    body_end = max(body_start + 1, dur - 5)
+    body_duration = body_end - body_start
+    n_body = max(1, body_duration // 15)  # ~15 sec per segment
+
+    for i in range(n_body):
+        seg_start = body_start + i * (body_duration // n_body)
+        seg_end = body_start + (i + 1) * (body_duration // n_body)
+        segments.append({
+            "index": i + 1,
+            "type": "body",
+            "start_sec": seg_start,
+            "end_sec": seg_end,
+            "text": f"[Основная часть {i + 1}/{n_body}] — раскрытие темы «{topic}»",
+            "notes": f"segment {i+1}, style: {style}, tone: {tone}",
+        })
+
+    # CTA / outro
+    segments.append({
+        "index": len(segments),
+        "type": "cta",
+        "start_sec": body_end,
+        "end_sec": dur,
+        "text": "Подписывайтесь и ставьте лайк! До встречи в следующем видео.",
+        "notes": "call to action + closing",
+    })
+
+    script_data = {
+        "topic": topic,
+        "style": style,
+        "tone": tone,
+        "language": language,
+        "target_duration_sec": dur,
+        "hook": hook,
+        "keywords": keywords,
+        "segments": segments,
+        "full_text": existing_script or "\n".join(s["text"] for s in segments),
+    }
+
+    # Save to task folder
+    script_path = ctx.task_dir / "script.json"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(json.dumps(script_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Also save plain text version
+    text_path = ctx.task_dir / "script.txt"
+    text_path.write_text(script_data["full_text"], encoding="utf-8")
+
+    # Store in context for downstream steps
+    ctx.outputs["script_data"] = script_data
+    ctx.outputs["script_path"] = str(script_path)
+    ctx.caption_text = script_data["full_text"]
+
+    ctx.log(f"[G01_SCRIPT] Generated script: {len(segments)} segments, {dur}s, {len(keywords)} keywords")
+
+    return {
+        "path": str(script_path),
+        "text_path": str(text_path),
+        "segments_count": len(segments),
+        "duration_sec": dur,
+        "topic": topic,
+        "style": style,
+    }
+
+
+@PipelineExecutor.register("G02_CAPTIONS")
+async def handle_generate_captions(ctx: StepContext, params: dict) -> dict:
+    """Generate SRT captions from script segments.
+
+    Uses the script produced by G01_SCRIPT (or candidate_meta) to build
+    timed SRT/ASS subtitle files without requiring Whisper.
+    """
+    script_data = ctx.outputs.get("script_data") or {}
+    segments = script_data.get("segments", [])
+    meta = ctx.candidate_meta or {}
+
+    # Fallback: build segments from meta captions_draft
+    if not segments:
+        captions_draft = meta.get("captions_draft") or ctx.caption_text or ""
+        if captions_draft:
+            lines = [l.strip() for l in captions_draft.split("\n") if l.strip()]
+            dur = script_data.get("target_duration_sec", 60) or 60
+            per_line = max(2, dur // max(len(lines), 1))
+            segments = []
+            for i, line in enumerate(lines):
+                segments.append({
+                    "index": i,
+                    "type": "caption",
+                    "start_sec": i * per_line,
+                    "end_sec": (i + 1) * per_line,
+                    "text": line,
+                })
+
+    if not segments:
+        ctx.log("[G02_CAPTIONS] No segments to build captions from")
+        return {"skipped": True, "reason": "no segments"}
+
+    fmt = params.get("format", "srt")
+    max_chars = params.get("max_chars_per_line", 42)
+
+    # Word-wrap long lines
+    def wrap(text: str, limit: int) -> str:
+        words = text.split()
+        lines: list[str] = []
+        current = ""
+        for w in words:
+            if current and len(current) + 1 + len(w) > limit:
+                lines.append(current)
+                current = w
+            else:
+                current = f"{current} {w}".strip()
+        if current:
+            lines.append(current)
+        return "\n".join(lines)
+
+    # Build SRT
+    srt_lines = []
+    for i, seg in enumerate(segments, 1):
+        start = _format_srt_time(seg.get("start_sec", 0))
+        end = _format_srt_time(seg.get("end_sec", 0))
+        text = wrap(seg.get("text", ""), max_chars)
+        srt_lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+
+    srt_content = "\n".join(srt_lines)
+    srt_path = ctx.task_dir / "captions.srt"
+    srt_path.write_text(srt_content, encoding="utf-8")
+
+    ctx.outputs["captions_path"] = str(srt_path)
+    ctx.outputs["captions_segments"] = segments
+    ctx.captions_path = srt_path
+
+    # Optionally build ASS too
+    ass_path = None
+    if fmt == "ass" or params.get("also_ass", False):
+        font = params.get("font", "Arial")
+        font_size = params.get("font_size", 48)
+        outline = params.get("outline", 2)
+        position = params.get("position", "bottom")
+        style = params.get("style", "bold")
+
+        ass_content = _build_ass_file(
+            segments=[{
+                "start": s.get("start_sec", 0),
+                "end": s.get("end_sec", 0),
+                "text": s.get("text", ""),
+            } for s in segments],
+            text=ctx.caption_text or "",
+            font=font, font_size=font_size, outline=outline,
+            position=position, style=style,
+        )
+        ass_path = ctx.task_dir / "captions.ass"
+        ass_path.write_text(ass_content, encoding="utf-8")
+
+    ctx.log(f"[G02_CAPTIONS] Built {len(segments)} caption segments")
+
+    return {
+        "srt_path": str(srt_path),
+        "ass_path": str(ass_path) if ass_path else None,
+        "segments_count": len(segments),
+        "format": fmt,
+    }
+
+
+@PipelineExecutor.register("G03_TTS")
+async def handle_generate_tts(ctx: StepContext, params: dict) -> dict:
+    """Generate TTS audio from script text (stub: creates silent placeholder).
+
+    When a real TTS provider is configured (edge_tts, elevenlabs, etc.),
+    swap the stub section below. The output audio is saved as voice.mp3
+    in the task folder and registered for downstream audio mixing.
+    """
+    script_data = ctx.outputs.get("script_data") or {}
+    text = script_data.get("full_text") or ctx.caption_text or ""
+
+    if not text:
+        ctx.log("[G03_TTS] No text for TTS")
+        return {"skipped": True, "reason": "no text"}
+
+    provider = params.get("provider", "stub")
+    voice = params.get("voice", "ru-RU-DmitryNeural")
+    output_path = ctx.task_dir / "voice.mp3"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    duration_sec = script_data.get("target_duration_sec", 30) or 30
+
+    if provider == "edge_tts":
+        try:
+            import edge_tts
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(str(output_path))
+        except ImportError:
+            ctx.log("[G03_TTS] edge_tts not installed, falling back to stub")
+            provider = "stub"
+
+    if provider == "stub":
+        # Generate silent audio placeholder with correct duration
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=mono",
+            "-t", str(duration_sec),
+            "-c:a", "libmp3lame",
+            "-b:a", "128k",
+            str(output_path),
+        ]
+        await run_cmd(cmd, ctx.log)
+
+    size = output_path.stat().st_size if output_path.exists() else 0
+
+    # Register for downstream steps (T11_AUDIO_MIX, T12_REPLACE_AUDIO)
+    ctx.outputs["synth_audio_path"] = str(output_path)
+    ctx.outputs["audio_path"] = str(output_path)
+
+    ctx.log(f"[G03_TTS] Generated audio: {provider}, {size} bytes, {duration_sec}s")
+
+    return {
+        "path": str(output_path),
+        "provider": provider,
+        "voice": voice,
+        "duration_sec": duration_sec,
+        "size": size,
+        "text_length": len(text),
+    }
