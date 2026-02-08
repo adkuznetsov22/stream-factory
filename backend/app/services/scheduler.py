@@ -33,6 +33,7 @@ logger = logging.getLogger("scheduler")
 # Advisory lock keys (arbitrary int64 — unique per job type)
 LOCK_TASK_GENERATION = 900_001
 LOCK_SYNC_ACCOUNTS = 900_002
+LOCK_SYNC_PUBLISHED_METRICS = 900_003
 
 
 class SchedulerService:
@@ -108,6 +109,14 @@ class SchedulerService:
             IntervalTrigger(hours=6),
             id="sync_accounts",
             name="Sync source accounts",
+            replace_existing=True,
+        )
+
+        self.scheduler.add_job(
+            self._run_sync_published_metrics,
+            IntervalTrigger(hours=4),
+            id="sync_published_metrics",
+            name="Sync published video metrics",
             replace_existing=True,
         )
         
@@ -197,6 +206,32 @@ class SchedulerService:
             finally:
                 await self._release_advisory_lock(session, LOCK_SYNC_ACCOUNTS)
     
+    async def _run_sync_published_metrics(self):
+        """Sync metrics for published videos (views, likes, comments, shares).
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_SYNC_PUBLISHED_METRICS)
+            if not acquired:
+                logger.debug("[sync_published_metrics] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[sync_published_metrics] LEADER — syncing published video metrics")
+                from app.services.sync_published_metrics import sync_published_metrics
+
+                result = await sync_published_metrics(session)
+
+                logger.info(
+                    "[sync_published_metrics] Completed: %d synced, %d errors",
+                    result.get("synced", 0),
+                    result.get("errors", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_SYNC_PUBLISHED_METRICS)
+
     async def _sync_account(self, session: AsyncSession, account):
         """Sync a single account based on platform."""
         platform = account.platform.value.lower() if hasattr(account.platform, 'value') else str(account.platform).lower()

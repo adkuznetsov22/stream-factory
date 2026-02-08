@@ -829,3 +829,34 @@ class Candidate(Base):
         back_populates="candidate", foreign_keys=[linked_publish_task_id]
     )
     brief: Mapped["Brief | None"] = relationship(back_populates="candidates")
+
+
+class PublishedVideoMetrics(Base):
+    """Periodic snapshots of metrics for published videos.
+
+    Each row is a point-in-time snapshot (views, likes, comments, shares)
+    for a published task. Collected by sync_published_metrics scheduler job.
+    Enables analytics: candidate_score → actual performance.
+    """
+    __tablename__ = "published_video_metrics"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("publish_tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    candidate_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("candidates.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    platform: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    external_id: Mapped[str | None] = mapped_column(sa.String(512), nullable=True)
+
+    views: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+    likes: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+    comments: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+    shares: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+
+    snapshot_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False, index=True
+    )
+    hours_since_publish: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)
+    raw_data: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)

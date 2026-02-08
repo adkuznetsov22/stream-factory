@@ -1605,6 +1605,108 @@ async def publish_task(task_id: int, session: AsyncSession = SessionDep):
     return result
 
 
+@router.get("/publish-tasks/{task_id}/metrics", response_model=list[dict])
+async def get_task_metrics(task_id: int, session: AsyncSession = SessionDep):
+    """Get metric snapshots for a published task."""
+    from app.models import PublishedVideoMetrics
+    result = await session.execute(
+        select(PublishedVideoMetrics)
+        .where(PublishedVideoMetrics.task_id == task_id)
+        .order_by(PublishedVideoMetrics.snapshot_at)
+    )
+    rows = result.scalars().all()
+    return [
+        {
+            "id": r.id,
+            "task_id": r.task_id,
+            "candidate_id": r.candidate_id,
+            "platform": r.platform,
+            "views": r.views,
+            "likes": r.likes,
+            "comments": r.comments,
+            "shares": r.shares,
+            "snapshot_at": r.snapshot_at.isoformat() if r.snapshot_at else None,
+            "hours_since_publish": r.hours_since_publish,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/projects/{project_id}/analytics/score-vs-performance", response_model=list[dict])
+async def score_vs_performance(project_id: int, session: AsyncSession = SessionDep):
+    """Candidate virality_score → actual published video performance.
+
+    Returns list of {candidate_id, virality_score, virality_factors,
+    views, likes, comments, shares, hours_since_publish} for all
+    published candidates in the project. Uses latest metric snapshot.
+    """
+    from app.models import Candidate, PublishedVideoMetrics, PublishTask
+    from sqlalchemy import func, and_
+
+    # Subquery: latest snapshot per task_id
+    latest_snap = (
+        select(
+            PublishedVideoMetrics.task_id,
+            func.max(PublishedVideoMetrics.snapshot_at).label("max_snap"),
+        )
+        .group_by(PublishedVideoMetrics.task_id)
+        .subquery()
+    )
+
+    query = (
+        select(
+            Candidate.id.label("candidate_id"),
+            Candidate.virality_score,
+            Candidate.virality_factors,
+            Candidate.title,
+            Candidate.platform,
+            PublishedVideoMetrics.views,
+            PublishedVideoMetrics.likes,
+            PublishedVideoMetrics.comments,
+            PublishedVideoMetrics.shares,
+            PublishedVideoMetrics.hours_since_publish,
+            PublishedVideoMetrics.snapshot_at,
+            PublishTask.published_url,
+        )
+        .join(PublishTask, Candidate.linked_publish_task_id == PublishTask.id)
+        .join(PublishedVideoMetrics, PublishedVideoMetrics.task_id == PublishTask.id)
+        .join(
+            latest_snap,
+            and_(
+                PublishedVideoMetrics.task_id == latest_snap.c.task_id,
+                PublishedVideoMetrics.snapshot_at == latest_snap.c.max_snap,
+            ),
+        )
+        .where(
+            Candidate.project_id == project_id,
+            Candidate.virality_score.isnot(None),
+            PublishTask.status == "published",
+        )
+        .order_by(Candidate.virality_score.desc())
+    )
+
+    result = await session.execute(query)
+    rows = result.all()
+
+    return [
+        {
+            "candidate_id": row.candidate_id,
+            "virality_score": row.virality_score,
+            "virality_factors": row.virality_factors,
+            "title": row.title,
+            "platform": row.platform,
+            "views": row.views,
+            "likes": row.likes,
+            "comments": row.comments,
+            "shares": row.shares,
+            "hours_since_publish": row.hours_since_publish,
+            "snapshot_at": row.snapshot_at.isoformat() if row.snapshot_at else None,
+            "published_url": row.published_url,
+        }
+        for row in rows
+    ]
+
+
 @router.get("/export-profiles", response_model=list[ExportProfileRead])
 async def list_export_profiles(session: AsyncSession = SessionDep):
     """Список всех доступных export-профилей."""
