@@ -38,6 +38,7 @@ LOCK_AGGREGATE_SNAPSHOTS = 900_004
 LOCK_CALIBRATE_SCORING = 900_005
 LOCK_AUTO_APPROVE = 900_006
 LOCK_AUTO_PROCESS = 900_007
+LOCK_AUTO_PUBLISH = 900_008
 
 
 class SchedulerService:
@@ -158,6 +159,15 @@ class SchedulerService:
                 name="Auto-process queued tasks",
                 replace_existing=True,
             )
+
+        # Auto-publish: publish ready tasks within time windows
+        self.scheduler.add_job(
+            self._run_auto_publish,
+            IntervalTrigger(minutes=2),
+            id="auto_publish",
+            name="Auto-publish ready tasks",
+            replace_existing=True,
+        )
         
         self.scheduler.start()
         self._running = True
@@ -348,6 +358,32 @@ class SchedulerService:
                 return result
             finally:
                 await self._release_advisory_lock(session, LOCK_AUTO_APPROVE)
+
+    async def _run_auto_publish(self):
+        """Auto-publish ready tasks within time windows.
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_AUTO_PUBLISH)
+            if not acquired:
+                logger.debug("[auto_publish] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[auto_publish] LEADER — running auto-publish")
+                from app.services.auto_publish_service import run_auto_publish
+
+                result = await run_auto_publish(session)
+
+                logger.info(
+                    "[auto_publish] Completed: %d started, %d skipped",
+                    result.get("started_count", 0),
+                    result.get("skipped_count", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_AUTO_PUBLISH)
 
     async def _run_auto_process(self):
         """Auto-process queued tasks with concurrency limits.

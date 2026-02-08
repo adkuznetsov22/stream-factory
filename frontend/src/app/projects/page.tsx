@@ -29,6 +29,15 @@ type AutoApproveReport = {
   dry_run?: boolean;
 };
 
+type PublishSettings = {
+  publish_enabled?: boolean;
+  timezone?: string;
+  windows?: Record<string, string[][]>;
+  min_gap_minutes_per_destination?: number;
+  daily_limit_per_destination?: number;
+  jitter_minutes?: number;
+};
+
 type Project = {
   id: number;
   name: string;
@@ -39,6 +48,7 @@ type Project = {
   export_profile_id?: number | null;
   policy?: Policy | null;
   feed_settings?: FeedSettings | null;
+  meta?: Record<string, unknown> | null;
 };
 
 type Source = { id: number; platform: string; social_account_id: number };
@@ -216,6 +226,168 @@ function AutoApproveBlock({
   );
 }
 
+type AutoPublishReport = {
+  started_count: number;
+  skipped_count: number;
+  started: { project_id: number; task_id: number; destination_account_id?: number; score?: number; dry_run?: boolean; success?: boolean; published_url?: string; error?: string }[];
+  skipped: { project_id?: number; task_id?: number; reason: string; count?: number }[];
+  dry_run: boolean;
+  run_at?: string;
+};
+
+function PublishScheduleBlock({
+  project, onUpdate, report, running, onRunNow,
+}: {
+  project: Project;
+  onUpdate: (meta: Record<string, unknown>) => void;
+  report: AutoPublishReport | null;
+  running: boolean;
+  onRunNow: (dryRun: boolean) => void;
+}) {
+  const meta = (project.meta || {}) as Record<string, unknown>;
+  const ps = (meta.publish_settings || {}) as PublishSettings;
+  const enabled = ps.publish_enabled ?? false;
+  const tz = ps.timezone ?? "Europe/Berlin";
+  const minGap = ps.min_gap_minutes_per_destination ?? 90;
+  const dailyLimit = ps.daily_limit_per_destination ?? 3;
+  const jitter = ps.jitter_minutes ?? 0;
+  const windows = ps.windows || {};
+  const weekdayWindow = (windows.mon || [["10:00", "22:00"]])[0] || ["10:00", "22:00"];
+  const weekendWindow = (windows.sat || [["12:00", "20:00"]])[0] || ["12:00", "20:00"];
+
+  const set = (patch: Partial<PublishSettings>) => {
+    const newPs = { ...ps, ...patch };
+    onUpdate({ ...meta, publish_settings: newPs });
+  };
+
+  const setWindows = (weekday: string[], weekend: string[]) => {
+    const w: Record<string, string[][]> = {};
+    for (const d of ["mon", "tue", "wed", "thu", "fri"]) w[d] = [weekday];
+    for (const d of ["sat", "sun"]) w[d] = [weekend];
+    set({ windows: w });
+  };
+
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <span style={{ fontWeight: 600, fontSize: 14, display: "block", marginBottom: 12 }}>Publish Schedule</span>
+      <div style={{
+        background: enabled ? "#3b82f608" : "var(--bg-muted)",
+        border: `1px solid ${enabled ? "#3b82f640" : "var(--border)"}`,
+        borderRadius: 10, padding: 16,
+      }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", marginBottom: 12 }}>
+          <input type="checkbox" checked={enabled} onChange={e => set({ publish_enabled: e.target.checked })} />
+          <span style={{ fontSize: 13, fontWeight: 500 }}>Автоматическая публикация по расписанию</span>
+        </label>
+
+        {enabled && (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Timezone</label>
+                <select value={tz} onChange={e => set({ timezone: e.target.value })} style={{ width: "100%" }}>
+                  {["UTC", "Europe/Moscow", "Europe/Berlin", "Europe/London", "America/New_York", "Asia/Tokyo"].map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Лимит / dest / день</label>
+                <input type="number" min={1} max={50} value={dailyLimit}
+                  onChange={e => set({ daily_limit_per_destination: Number(e.target.value) || 3 })}
+                  style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Min gap (мин)</label>
+                <input type="number" min={0} max={1440} value={minGap}
+                  onChange={e => set({ min_gap_minutes_per_destination: Number(e.target.value) || 90 })}
+                  style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Jitter (мин)</label>
+                <input type="number" min={0} max={60} value={jitter}
+                  onChange={e => set({ jitter_minutes: Number(e.target.value) || 0 })}
+                  style={{ width: "100%" }} />
+              </div>
+            </div>
+
+            {/* Windows */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Будни (пн-пт)</label>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <input type="time" value={weekdayWindow[0]} onChange={e => setWindows([e.target.value, weekdayWindow[1]], weekendWindow)} style={{ flex: 1 }} />
+                  <span style={{ fontSize: 12 }}>—</span>
+                  <input type="time" value={weekdayWindow[1]} onChange={e => setWindows([weekdayWindow[0], e.target.value], weekendWindow)} style={{ flex: 1 }} />
+                </div>
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Выходные (сб-вс)</label>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <input type="time" value={weekendWindow[0]} onChange={e => setWindows(weekdayWindow, [e.target.value, weekendWindow[1]])} style={{ flex: 1 }} />
+                  <span style={{ fontSize: 12 }}>—</span>
+                  <input type="time" value={weekendWindow[1]} onChange={e => setWindows(weekdayWindow, [weekendWindow[0], e.target.value])} style={{ flex: 1 }} />
+                </div>
+              </div>
+            </div>
+
+            {/* Run buttons */}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => onRunNow(false)} disabled={running}
+                style={{ padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  background: running ? "var(--bg-muted)" : "#3b82f620", color: running ? "var(--fg-subtle)" : "#3b82f6", border: "1px solid #3b82f640" }}>
+                {running ? "Публикация..." : "▶ Опубликовать"}
+              </button>
+              <button onClick={() => onRunNow(true)} disabled={running}
+                style={{ padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  background: running ? "var(--bg-muted)" : "#dbeafe", color: running ? "var(--fg-subtle)" : "#2563eb", border: "1px solid #93c5fd" }}>
+                Dry Run
+              </button>
+            </div>
+
+            {/* Report */}
+            {report && (
+              <div style={{ marginTop: 12, padding: 12, background: "var(--bg-subtle)", borderRadius: 8, border: "1px solid var(--border)" }}>
+                <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12, alignItems: "center" }}>
+                  {report.dry_run && <span style={{ background: "#dbeafe", color: "#2563eb", padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 600 }}>DRY RUN</span>}
+                  <span style={{ color: "#22c55e" }}>Опубликовано: <strong>{report.started_count}</strong></span>
+                  <span style={{ color: "#ef4444" }}>Пропущено: <strong>{report.skipped_count}</strong></span>
+                  {report.run_at && <span style={{ color: "var(--fg-subtle)" }}>{new Date(report.run_at).toLocaleTimeString("ru")}</span>}
+                </div>
+                {report.started.length > 0 && (
+                  <div style={{ fontSize: 11, marginBottom: 6 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>Запущены:</div>
+                    {report.started.map(s => (
+                      <div key={s.task_id} style={{ display: "flex", gap: 8, padding: "2px 0" }}>
+                        <span style={{ color: "#22c55e" }}>✓</span>
+                        <span>Task #{s.task_id}</span>
+                        {s.published_url && <a href={s.published_url} target="_blank" rel="noreferrer" style={{ color: "#2563eb", fontSize: 10 }}>{s.published_url}</a>}
+                        {s.error && <span style={{ color: "#ef4444", fontSize: 10 }}>{s.error}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {report.skipped.length > 0 && (
+                  <div style={{ fontSize: 11 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4, color: "var(--fg-subtle)" }}>Пропущены:</div>
+                    {report.skipped.slice(0, 5).map((s, i) => (
+                      <div key={i} style={{ display: "flex", gap: 8, padding: "2px 0", color: "var(--fg-subtle)" }}>
+                        <span>✕</span>
+                        <span>{s.task_id ? `Task #${s.task_id}` : `${s.count || 1} задач`}</span>
+                        <span style={{ fontSize: 10 }}>{s.reason}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -229,6 +401,8 @@ export default function ProjectsPage() {
   const [form, setForm] = useState({ name: "", mode: "MANUAL", preset_id: "" });
   const [aaReport, setAaReport] = useState<AutoApproveReport | null>(null);
   const [aaRunning, setAaRunning] = useState(false);
+  const [apReport, setApReport] = useState<AutoPublishReport | null>(null);
+  const [apRunning, setApRunning] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -506,6 +680,23 @@ export default function ProjectsPage() {
                         const res = await fetch(`/api/projects/${p.id}/auto-approve${qs}`, { method: "POST" });
                         if (res.ok) setAaReport(await res.json());
                         setAaRunning(false);
+                        if (!dryRun) load();
+                      }}
+                    />
+
+                    {/* Publish Schedule */}
+                    <PublishScheduleBlock
+                      project={p}
+                      onUpdate={(newMeta) => updateProject(p.id, { meta: newMeta } as any)}
+                      report={expanded === p.id ? apReport : null}
+                      running={apRunning}
+                      onRunNow={async (dryRun: boolean) => {
+                        setApRunning(true);
+                        setApReport(null);
+                        const qs = dryRun ? "?dry_run=true" : "";
+                        const res = await fetch(`/api/scheduler/auto-publish${qs}`, { method: "POST" });
+                        if (res.ok) setApReport(await res.json());
+                        setApRunning(false);
                         if (!dryRun) load();
                       }}
                     />

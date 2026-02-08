@@ -150,8 +150,8 @@ async def update_project(project_id: int, data: ProjectUpdate, session: AsyncSes
     project = await session.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-    for field in ["name", "theme_type", "status", "mode", "settings_json", "preset_id"]:
-        value = getattr(data, field)
+    for field in ["name", "theme_type", "status", "mode", "settings_json", "policy", "feed_settings", "meta", "export_profile_id", "preset_id"]:
+        value = getattr(data, field, None)
         if value is not None:
             setattr(project, field, value)
     session.add(project)
@@ -2073,6 +2073,21 @@ async def trigger_auto_process(
     """
     from app.services.auto_process_service import run_auto_process
     return await run_auto_process(session, dry_run=dry_run)
+
+
+@router.post("/scheduler/auto-publish", response_model=dict)
+async def trigger_auto_publish(
+    dry_run: bool = Query(default=False),
+    session: AsyncSession = SessionDep,
+):
+    """Manually trigger auto-publish for ready tasks.
+
+    Publishes tasks within time windows, respecting daily limits,
+    min-gap spacing, and jitter.
+    Pass ?dry_run=true to preview without publishing.
+    """
+    from app.services.auto_publish_service import run_auto_publish
+    return await run_auto_publish(session, dry_run=dry_run)
 
 
 @router.get("/export-profiles", response_model=list[ExportProfileRead])

@@ -153,6 +153,7 @@ class ProjectRead(BaseModel):
     settings_json: dict | None = None
     policy: dict | None = None
     feed_settings: dict | None = None
+    meta: dict | None = None
     export_profile_id: int | None = None
     preset_id: int | None = None
     created_at: datetime | None = None
@@ -170,6 +171,7 @@ class ProjectUpdate(BaseModel):
     settings_json: dict | None = None
     policy: dict | None = None
     feed_settings: dict | None = None
+    meta: dict | None = None
     export_profile_id: int | None = None
     preset_id: int | None = None
 
