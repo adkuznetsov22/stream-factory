@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 
 type Candidate = {
   id: number;
@@ -20,6 +20,9 @@ type Candidate = {
   shares: number | null;
   subscribers: number | null;
   virality_score: number | null;
+  origin: string;
+  brief_id: number | null;
+  meta: Record<string, unknown> | null;
   status: string;
   manual_rating: number | null;
   notes: string | null;
@@ -75,6 +78,7 @@ function statusBadge(status: string): { bg: string; fg: string } {
 export default function ProjectFeedPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const projectId = Number(params?.id);
 
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -88,6 +92,7 @@ export default function ProjectFeedPage() {
   const [minScore, setMinScore] = useState("");
   const [includeUsed, setIncludeUsed] = useState(false);
   const [statusFilter, setStatusFilter] = useState("");
+  const [originFilter, setOriginFilter] = useState(searchParams?.get("origin") || "");
 
   // Rating modal
   const [ratingTarget, setRatingTarget] = useState<Candidate | null>(null);
@@ -107,6 +112,7 @@ export default function ProjectFeedPage() {
     if (minScore) params.set("min_score", minScore);
     if (includeUsed) params.set("include_used", "true");
     if (statusFilter) params.set("status", statusFilter);
+    if (originFilter) params.set("origin", originFilter);
     params.set("limit", "100");
 
     try {
@@ -118,7 +124,7 @@ export default function ProjectFeedPage() {
     } finally {
       setLoading(false);
     }
-  }, [projectId, platform, minScore, includeUsed, statusFilter]);
+  }, [projectId, platform, minScore, includeUsed, statusFilter, originFilter]);
 
   useEffect(() => { loadFeed(); }, [loadFeed]);
 
@@ -285,6 +291,15 @@ export default function ProjectFeedPage() {
           </select>
         </div>
 
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <label style={{ fontSize: 12, color: "var(--fg-subtle)", whiteSpace: "nowrap" }}>Источник</label>
+          <select value={originFilter} onChange={e => setOriginFilter(e.target.value)} style={{ fontSize: 13, padding: "6px 10px" }}>
+            <option value="">Все</option>
+            <option value="REPURPOSE">Repurpose</option>
+            <option value="GENERATE">Generate</option>
+          </select>
+        </div>
+
         <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}>
           <input type="checkbox" checked={includeUsed} onChange={e => setIncludeUsed(e.target.checked)} />
           <span style={{ color: "var(--fg-subtle)" }}>Показать использованные</span>
@@ -337,10 +352,22 @@ export default function ProjectFeedPage() {
                   {/* Platform badge */}
                   <div style={{
                     position: "absolute", top: 8, left: 8,
-                    padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
-                    background: platColor, color: "#fff",
+                    display: "flex", gap: 4,
                   }}>
-                    {platIcon} {c.platform}
+                    <div style={{
+                      padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                      background: platColor, color: "#fff",
+                    }}>
+                      {platIcon} {c.platform}
+                    </div>
+                    {c.origin === "GENERATE" && (
+                      <div style={{
+                        padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                        background: "#8b5cf6", color: "#fff",
+                      }}>
+                        ⚡ GEN
+                      </div>
+                    )}
                   </div>
                   {/* Virality score */}
                   <div style={{
@@ -380,13 +407,30 @@ export default function ProjectFeedPage() {
                     <span>{fmtDate(c.published_at)}</span>
                   </div>
 
-                  {/* Metrics row */}
-                  <div style={{ display: "flex", gap: 12, fontSize: 12, color: "var(--fg-subtle)", marginBottom: 12 }}>
-                    <span title="Просмотры">👁 {fmt(c.views)}</span>
-                    <span title="Лайки">❤ {fmt(c.likes)}</span>
-                    <span title="Комментарии">💬 {fmt(c.comments)}</span>
-                    {c.shares != null && <span title="Репосты">↗ {fmt(c.shares)}</span>}
-                  </div>
+                  {/* Metrics row or GENERATE meta */}
+                  {c.origin === "GENERATE" && c.meta ? (
+                    <div style={{ fontSize: 12, color: "var(--fg-subtle)", marginBottom: 12 }}>
+                      {typeof c.meta.hook === "string" && (
+                        <div style={{ marginBottom: 4, fontStyle: "italic" }}>
+                          &quot;{(c.meta.hook as string).slice(0, 80)}...&quot;
+                        </div>
+                      )}
+                      {Array.isArray(c.meta.keywords) && (
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                          {(c.meta.keywords as string[]).slice(0, 5).map((kw, i) => (
+                            <span key={i} style={{ padding: "1px 6px", borderRadius: 4, background: "var(--bg-hover)", fontSize: 11 }}>#{kw}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", gap: 12, fontSize: 12, color: "var(--fg-subtle)", marginBottom: 12 }}>
+                      <span title="Просмотры">👁 {fmt(c.views)}</span>
+                      <span title="Лайки">❤ {fmt(c.likes)}</span>
+                      <span title="Комментарии">💬 {fmt(c.comments)}</span>
+                      {c.shares != null && <span title="Репосты">↗ {fmt(c.shares)}</span>}
+                    </div>
+                  )}
 
                   {/* Actions */}
                   <div style={{ display: "flex", gap: 6 }}>

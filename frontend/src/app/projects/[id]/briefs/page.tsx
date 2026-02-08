@@ -70,6 +70,7 @@ export default function ProjectBriefsPage() {
   const [editId, setEditId] = useState<number | null>(null);
   const [form, setForm] = useState(emptyForm);
   const [saving, setSaving] = useState(false);
+  const [generating, setGenerating] = useState<number | null>(null);
 
   const showToast = (message: string, type: "success" | "error" = "success") => {
     setToast({ message, type });
@@ -236,6 +237,31 @@ export default function ProjectBriefsPage() {
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 6, marginLeft: 12, flexShrink: 0 }}>
+                    <button
+                      onClick={async () => {
+                        setGenerating(b.id);
+                        try {
+                          const res = await fetch(`/api/briefs/${b.id}/generate`, { method: "POST" });
+                          if (res.ok) {
+                            const data = await res.json();
+                            showToast(`Сгенерирован candidate #${data.id}`);
+                            setTimeout(() => router.push(`/projects/${projectId}/feed?origin=GENERATE`), 800);
+                          } else {
+                            const err = await res.json().catch(() => ({ detail: "Ошибка" }));
+                            showToast(err.detail || "Ошибка генерации", "error");
+                          }
+                        } catch { showToast("Сетевая ошибка", "error"); }
+                        setGenerating(null);
+                      }}
+                      disabled={generating === b.id}
+                      style={{
+                        padding: "6px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                        background: "#8b5cf620", color: "#8b5cf6",
+                        opacity: generating === b.id ? 0.5 : 1,
+                      }}
+                    >
+                      {generating === b.id ? "⟳ ..." : "⚡ Generate"}
+                    </button>
                     <button onClick={() => openEdit(b)} style={{ padding: "6px 12px", background: "var(--bg-hover)", borderRadius: 6, fontSize: 12 }}>✏ Ред.</button>
                     <select
                       value={b.status}
