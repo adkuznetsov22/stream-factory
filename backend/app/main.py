@@ -22,6 +22,7 @@ from .routes_dashboard import router as dashboard_router
 from .routes_auth import router as auth_router
 from .routes_feed import router as feed_router
 from .routes_briefs import router as briefs_router
+from .routes_ops import router as ops_router
 from .settings import get_settings
 
 logger = logging.getLogger("app")
@@ -67,6 +68,7 @@ app.include_router(dashboard_router)
 app.include_router(auth_router)
 app.include_router(feed_router)
 app.include_router(briefs_router)
+app.include_router(ops_router)
 
 
 @app.on_event("startup")

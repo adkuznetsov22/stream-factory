@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     auto_process_interval_minutes: int = Field(default=5, validation_alias=AliasChoices("AUTO_PROCESS_INTERVAL_MINUTES", "STREAM_FACTORY_AUTO_PROCESS_INTERVAL_MINUTES"))
     auto_process_max_parallel: int = Field(default=2, validation_alias=AliasChoices("AUTO_PROCESS_MAX_PARALLEL", "STREAM_FACTORY_AUTO_PROCESS_MAX_PARALLEL"))
     auto_process_max_parallel_per_destination: int = Field(default=1, validation_alias=AliasChoices("AUTO_PROCESS_MAX_PARALLEL_PER_DESTINATION", "STREAM_FACTORY_AUTO_PROCESS_MAX_PARALLEL_PER_DESTINATION"))
+    watchdog_enabled: bool = Field(default=True, validation_alias=AliasChoices("WATCHDOG_ENABLED", "STREAM_FACTORY_WATCHDOG_ENABLED"))
+    watchdog_interval_minutes: int = Field(default=5, validation_alias=AliasChoices("WATCHDOG_INTERVAL_MINUTES", "STREAM_FACTORY_WATCHDOG_INTERVAL_MINUTES"))
+    stuck_processing_minutes: int = Field(default=90, validation_alias=AliasChoices("STUCK_PROCESSING_MINUTES", "STREAM_FACTORY_STUCK_PROCESSING_MINUTES"))
+    stuck_publishing_minutes: int = Field(default=30, validation_alias=AliasChoices("STUCK_PUBLISHING_MINUTES", "STREAM_FACTORY_STUCK_PUBLISHING_MINUTES"))
+    watchdog_auto_requeue: bool = Field(default=False, validation_alias=AliasChoices("WATCHDOG_AUTO_REQUEUE", "STREAM_FACTORY_WATCHDOG_AUTO_REQUEUE"))
 
     @property
     def async_database_url(self) -> str:

@@ -40,6 +40,7 @@ LOCK_AUTO_APPROVE = 900_006
 LOCK_AUTO_PROCESS = 900_007
 LOCK_AUTO_PUBLISH = 900_008
 LOCK_AUTO_GENERATE = 900_009
+LOCK_WATCHDOG = 900_010
 
 
 class SchedulerService:
@@ -178,6 +179,16 @@ class SchedulerService:
             name="Auto-generate candidates from briefs",
             replace_existing=True,
         )
+
+        # Watchdog: find stuck tasks
+        if settings.watchdog_enabled:
+            self.scheduler.add_job(
+                self._run_watchdog,
+                IntervalTrigger(minutes=settings.watchdog_interval_minutes),
+                id="watchdog",
+                name="Watchdog: find stuck tasks",
+                replace_existing=True,
+            )
         
         self.scheduler.start()
         self._running = True
@@ -420,6 +431,31 @@ class SchedulerService:
                 return result
             finally:
                 await self._release_advisory_lock(session, LOCK_AUTO_GENERATE)
+
+    async def _run_watchdog(self):
+        """Watchdog: find stuck tasks and mark them as errors.
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_WATCHDOG)
+            if not acquired:
+                logger.debug("[watchdog] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[watchdog] LEADER — running watchdog")
+                from app.services.watchdog_service import run_watchdog
+
+                result = await run_watchdog(session)
+
+                logger.info(
+                    "[watchdog] Completed: %d stuck tasks found",
+                    result.get("stuck_count", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_WATCHDOG)
 
     async def _run_auto_process(self):
         """Auto-process queued tasks with concurrency limits.
