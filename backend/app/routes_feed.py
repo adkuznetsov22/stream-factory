@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -330,6 +333,184 @@ async def rate_candidate(
     await session.commit()
     await session.refresh(candidate)
     return candidate
+
+
+# ── Bulk moderation ───────────────────────────────────────────
+
+class BulkApproveBody(BaseModel):
+    ids: List[int]
+    destination_id: Optional[int] = None
+    task_priority: int = 0
+
+class BulkRejectBody(BaseModel):
+    ids: List[int]
+    reason: Optional[str] = None
+
+class BulkRateBody(BaseModel):
+    ids: List[int]
+    rating: int
+    notes: Optional[str] = None
+
+
+@router.post("/projects/{project_id}/feed/bulk-approve")
+async def bulk_approve(
+    project_id: int,
+    body: BulkApproveBody,
+    session: AsyncSession = SessionDep,
+):
+    """Bulk approve candidates → create PublishTasks."""
+    from app.services.simhash import find_near_duplicate
+
+    # Load project + destinations once
+    res = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .options(selectinload(Project.destinations))
+    )
+    project = res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.destinations:
+        raise HTTPException(status_code=400, detail="No destinations configured")
+
+    # Resolve destination
+    dest = None
+    if body.destination_id:
+        dest = next((d for d in project.destinations if d.id == body.destination_id), None)
+        if not dest:
+            raise HTTPException(status_code=404, detail=f"Destination #{body.destination_id} not found")
+    else:
+        dest = next((d for d in project.destinations if d.is_active), None)
+    if not dest:
+        raise HTTPException(status_code=400, detail="No active destination found")
+
+    _dedupe = ((project.meta or {}).get("dedupe_settings") or {})
+    _max_dist = _dedupe.get("simhash_max_distance", 6)
+
+    priority = max(-10, min(10, body.task_priority))
+    ok_list, failed_list = [], []
+
+    for cid in body.ids:
+        candidate = await session.get(Candidate, cid)
+        if not candidate or candidate.project_id != project_id:
+            failed_list.append({"candidate_id": cid, "reason": "not_found"})
+            continue
+        if candidate.status not in (CandidateStatus.new.value, CandidateStatus.rejected.value):
+            failed_list.append({"candidate_id": cid, "reason": f"invalid_status:{candidate.status}"})
+            continue
+
+        # Exact duplicate check
+        sig = (candidate.meta or {}).get("content_signature")
+        if sig:
+            dup = await find_duplicate(session, project_id, sig, exclude_candidate_id=candidate.id)
+            if dup:
+                failed_list.append({"candidate_id": cid, "reason": f"duplicate:#{dup.id}"})
+                continue
+
+        # Near-duplicate check
+        sh_hex = (candidate.meta or {}).get("content_simhash64")
+        if sh_hex:
+            near_dup, dist = await find_near_duplicate(
+                session, project_id, sh_hex, max_distance=_max_dist, exclude_id=candidate.id,
+            )
+            if near_dup:
+                failed_list.append({"candidate_id": cid, "reason": f"near_duplicate:#{near_dup.id} d={dist}"})
+                continue
+
+        # For GENERATE candidates, build task_meta
+        is_generate = candidate.origin == CandidateOrigin.generate.value
+        task_meta = None
+        if is_generate and candidate.brief_id:
+            brief = await session.get(Brief, candidate.brief_id)
+            if brief:
+                task_meta = {
+                    "origin": "GENERATE",
+                    "candidate_meta": candidate.meta or {},
+                    "brief": {"id": brief.id, "title": brief.title, "topic": brief.topic,
+                              "style": brief.style, "tone": brief.tone, "language": brief.language,
+                              "target_duration_sec": brief.target_duration_sec,
+                              "target_platform": brief.target_platform,
+                              "llm_prompt_template": brief.llm_prompt_template},
+                }
+
+        task = PublishTask(
+            project_id=project_id,
+            platform=dest.platform,
+            destination_social_account_id=dest.social_account_id,
+            external_id=candidate.platform_video_id,
+            permalink=candidate.url if not is_generate else None,
+            preview_url=candidate.thumbnail_url,
+            download_url=candidate.url if not is_generate else None,
+            caption_text=candidate.caption or candidate.title,
+            status="queued",
+            preset_id=project.preset_id,
+            total_steps=0,
+            priority=priority,
+            artifacts=task_meta,
+        )
+        session.add(task)
+        await session.flush()
+
+        candidate.status = CandidateStatus.approved.value
+        candidate.linked_publish_task_id = task.id
+        candidate.reviewed_at = datetime.now(timezone.utc)
+        session.add(candidate)
+
+        ok_list.append({"candidate_id": cid, "task_id": task.id})
+
+    await session.commit()
+    return {"ok": ok_list, "failed": failed_list}
+
+
+@router.post("/projects/{project_id}/feed/bulk-reject")
+async def bulk_reject(
+    project_id: int,
+    body: BulkRejectBody,
+    session: AsyncSession = SessionDep,
+):
+    """Bulk reject candidates."""
+    ok_list, failed_list = [], []
+    for cid in body.ids:
+        candidate = await session.get(Candidate, cid)
+        if not candidate or candidate.project_id != project_id:
+            failed_list.append({"candidate_id": cid, "reason": "not_found"})
+            continue
+        if candidate.status not in (CandidateStatus.new.value, CandidateStatus.approved.value):
+            failed_list.append({"candidate_id": cid, "reason": f"invalid_status:{candidate.status}"})
+            continue
+        candidate.status = CandidateStatus.rejected.value
+        candidate.reviewed_at = datetime.now(timezone.utc)
+        if body.reason:
+            candidate.notes = body.reason
+        session.add(candidate)
+        ok_list.append(cid)
+    await session.commit()
+    return {"ok": ok_list, "failed": failed_list}
+
+
+@router.post("/projects/{project_id}/feed/bulk-rate")
+async def bulk_rate(
+    project_id: int,
+    body: BulkRateBody,
+    session: AsyncSession = SessionDep,
+):
+    """Bulk set manual rating for candidates."""
+    if body.rating < 1 or body.rating > 5:
+        raise HTTPException(status_code=400, detail="rating must be 1-5")
+
+    ok_list, failed_list = [], []
+    for cid in body.ids:
+        candidate = await session.get(Candidate, cid)
+        if not candidate or candidate.project_id != project_id:
+            failed_list.append({"candidate_id": cid, "reason": "not_found"})
+            continue
+        candidate.manual_rating = body.rating
+        if body.notes is not None:
+            candidate.notes = body.notes
+        session.add(candidate)
+        ok_list.append(cid)
+    await session.commit()
+    return {"ok": ok_list, "failed": failed_list}
 
 
 # ── Sync sources into feed ─────────────────────────────────────

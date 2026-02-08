@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 
 type Candidate = {
@@ -111,6 +111,13 @@ export default function ProjectFeedPage() {
   const [ratingTarget, setRatingTarget] = useState<Candidate | null>(null);
   const [ratingValue, setRatingValue] = useState(3);
   const [ratingNotes, setRatingNotes] = useState("");
+
+  // Bulk selection + hotkeys
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const [bulkPriority, setBulkPriority] = useState(0);
+  const [bulkDestId, setBulkDestId] = useState<number | null>(null);
+  const cardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   const showToast = (message: string, type: "success" | "error" = "success") => {
     setToast({ message, type });
@@ -265,6 +272,123 @@ export default function ProjectFeedPage() {
     setRatingNotes(c.notes || "");
   };
 
+  // ── Bulk helpers ──────────────────────────────────────
+  const toggleSelect = (id: number) => setSelected(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s; });
+  const selectedIds = Array.from(selected);
+
+  const bulkApprove = async () => {
+    if (!selectedIds.length) return;
+    const activeDests = destinations.filter(d => d.is_active);
+    const destId = bulkDestId ?? activeDests[0]?.id ?? null;
+    try {
+      const res = await fetch(`/api/projects/${projectId}/feed/bulk-approve`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedIds, destination_id: destId, task_priority: bulkPriority }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        showToast(`Bulk approve: ${j.ok.length} ok, ${j.failed.length} failed`);
+        setSelected(new Set()); loadFeed();
+      } else showToast("Bulk approve error", "error");
+    } catch { showToast("Сетевая ошибка", "error"); }
+  };
+
+  const bulkReject = async (reason?: string) => {
+    if (!selectedIds.length) return;
+    try {
+      const res = await fetch(`/api/projects/${projectId}/feed/bulk-reject`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedIds, reason: reason || null }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        showToast(`Bulk reject: ${j.ok.length} ok, ${j.failed.length} failed`);
+        setSelected(new Set()); loadFeed();
+      } else showToast("Bulk reject error", "error");
+    } catch { showToast("Сетевая ошибка", "error"); }
+  };
+
+  const bulkRate = async (rating: number) => {
+    if (!selectedIds.length) return;
+    try {
+      const res = await fetch(`/api/projects/${projectId}/feed/bulk-rate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedIds, rating }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        showToast(`Bulk rate ${rating}★: ${j.ok.length} ok`);
+        setSelected(new Set()); loadFeed();
+      } else showToast("Bulk rate error", "error");
+    } catch { showToast("Сетевая ошибка", "error"); }
+  };
+
+  // ── Hotkeys ───────────────────────────────────────────
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (approveTarget || ratingTarget) {
+        if (e.key === "Escape") { setApproveTarget(null); setRatingTarget(null); }
+        return;
+      }
+
+      const len = candidates.length;
+      if (!len) return;
+
+      if (e.key === "j" || e.key === "J") {
+        e.preventDefault();
+        setActiveIndex(prev => {
+          const next = Math.min(prev + 1, len - 1);
+          cardRefs.current.get(next)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          return next;
+        });
+      } else if (e.key === "k" || e.key === "K") {
+        e.preventDefault();
+        setActiveIndex(prev => {
+          const next = Math.max(prev - 1, 0);
+          cardRefs.current.get(next)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          return next;
+        });
+      } else if (e.key === "a" || e.key === "A") {
+        if (activeIndex >= 0 && activeIndex < len) {
+          e.preventDefault();
+          openApproveModal(candidates[activeIndex]);
+        }
+      } else if (e.key === "r" || e.key === "R") {
+        if (activeIndex >= 0 && activeIndex < len) {
+          e.preventDefault();
+          reject(candidates[activeIndex]);
+        }
+      } else if (e.key >= "1" && e.key <= "5") {
+        if (activeIndex >= 0 && activeIndex < len) {
+          e.preventDefault();
+          const c = candidates[activeIndex];
+          fetch(`/api/projects/${projectId}/feed/${c.id}/rate`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ manual_rating: Number(e.key) }),
+          }).then(() => { showToast(`Оценка ${e.key}★`); loadFeed(); });
+        }
+      } else if (e.key === " ") {
+        if (activeIndex >= 0 && activeIndex < len) {
+          e.preventDefault();
+          const c = candidates[activeIndex];
+          if (c.url) window.open(c.url, "_blank");
+        }
+      } else if (e.key === "Escape") {
+        setSelected(new Set());
+        setActiveIndex(-1);
+      } else if (e.key === "x" || e.key === "X") {
+        if (activeIndex >= 0 && activeIndex < len) {
+          e.preventDefault();
+          toggleSelect(candidates[activeIndex].id);
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [candidates, activeIndex, approveTarget, ratingTarget, projectId]);
+
   if (!projectId) return <div className="empty">Некорректный ID</div>;
 
   const counts = {
@@ -356,6 +480,40 @@ export default function ProjectFeedPage() {
         </label>
       </div>
 
+      {/* Bulk actions bar */}
+      {selected.size > 0 && (
+        <div style={{
+          display: "flex", gap: 8, alignItems: "center", padding: "10px 16px", marginBottom: 12,
+          background: "#dbeafe", borderRadius: 10, flexWrap: "wrap",
+        }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "#1e40af" }}>{selected.size} выбрано</span>
+          <button onClick={bulkApprove} style={{ padding: "5px 14px", borderRadius: 6, fontSize: 11, fontWeight: 600, background: "#22c55e", color: "#fff", border: "none", cursor: "pointer" }}>✓ Approve</button>
+          <button onClick={() => bulkReject()} style={{ padding: "5px 14px", borderRadius: 6, fontSize: 11, fontWeight: 600, background: "#ef4444", color: "#fff", border: "none", cursor: "pointer" }}>✕ Reject</button>
+          {[1,2,3,4,5].map(n => (
+            <button key={n} onClick={() => bulkRate(n)} style={{ padding: "5px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600, background: "#eab30830", color: "#eab308", border: "none", cursor: "pointer" }}>{n}★</button>
+          ))}
+          <span style={{ fontSize: 11, color: "#475569" }}>P:</span>
+          <select value={bulkPriority} onChange={e => setBulkPriority(Number(e.target.value))} style={{ padding: "3px 4px", borderRadius: 4, fontSize: 11, border: "1px solid #93c5fd", width: 52 }}>
+            {Array.from({ length: 21 }, (_, i) => i - 10).reverse().map(v => <option key={v} value={v}>{v > 0 ? `+${v}` : v}</option>)}
+          </select>
+          {destinations.filter(d => d.is_active).length > 1 && (
+            <>
+              <span style={{ fontSize: 11, color: "#475569" }}>Dest:</span>
+              <select value={bulkDestId ?? ""} onChange={e => setBulkDestId(e.target.value ? Number(e.target.value) : null)} style={{ padding: "3px 4px", borderRadius: 4, fontSize: 11, border: "1px solid #93c5fd" }}>
+                <option value="">auto</option>
+                {destinations.filter(d => d.is_active).map(d => <option key={d.id} value={d.id}>{d.platform} #{d.social_account_id}</option>)}
+              </select>
+            </>
+          )}
+          <button onClick={() => setSelected(new Set())} style={{ padding: "5px 10px", borderRadius: 6, fontSize: 11, background: "transparent", color: "#64748b", border: "1px solid #cbd5e1", cursor: "pointer" }}>Сбросить</button>
+        </div>
+      )}
+
+      {/* Hotkey hint */}
+      <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 8 }}>
+        J/K — навигация · A — approve · R — reject · 1-5 — оценка · X — выбрать · Space — открыть · Esc — сбросить
+      </div>
+
       {/* Feed Grid */}
       {loading ? (
         <div style={{ padding: 60, textAlign: "center", color: "var(--fg-subtle)" }}>Загрузка...</div>
@@ -367,24 +525,36 @@ export default function ProjectFeedPage() {
         </div>
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340, 1fr))", gap: 16 }}>
-          {candidates.map(c => {
+          {candidates.map((c, idx) => {
             const platColor = PLATFORM_COLORS[c.platform] || "#888";
             const platIcon = PLATFORM_ICONS[c.platform] || "?";
             const badge = statusBadge(c.status);
             const isLoading = actionLoading === c.id;
 
+            const isActive = idx === activeIndex;
+            const isSelected = selected.has(c.id);
+
             return (
               <div
                 key={c.id}
+                ref={el => { if (el) cardRefs.current.set(idx, el); }}
+                onClick={() => setActiveIndex(idx)}
                 style={{
+                  position: "relative",
                   background: "var(--bg-subtle)",
                   borderRadius: "var(--radius-lg)",
-                  border: "1px solid var(--border)",
+                  border: isActive ? "2px solid #3b82f6" : isSelected ? "2px solid #93c5fd" : "1px solid var(--border)",
                   overflow: "hidden",
                   opacity: c.status === "REJECTED" ? 0.6 : 1,
-                  transition: "opacity 0.2s",
+                  transition: "all 0.15s",
+                  boxShadow: isActive ? "0 0 0 2px #3b82f640" : "none",
+                  cursor: "pointer",
                 }}
               >
+                {/* Checkbox */}
+                <div style={{ position: "absolute", top: 0, left: 0, zIndex: 10, padding: 6 }} onClick={e => e.stopPropagation()}>
+                  <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(c.id)} style={{ width: 16, height: 16, cursor: "pointer" }} />
+                </div>
                 {/* Thumbnail */}
                 <div style={{ position: "relative", height: 180, background: "var(--bg-muted)", overflow: "hidden" }}>
                   {c.thumbnail_url ? (
