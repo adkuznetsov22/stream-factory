@@ -1206,6 +1206,9 @@ async def handle_speech_to_text(ctx: StepContext, params: dict) -> dict:
             ctx.outputs["transcript_text"] = text
             ctx.outputs["transcript_segments"] = segments
             ctx.outputs["srt_path"] = str(srt_path)
+
+            # Update content_signature with transcript (more accurate)
+            _update_content_signature(ctx, text)
             
             return {
                 "text": text[:500] + "..." if len(text) > 500 else text,
@@ -1231,12 +1234,35 @@ async def handle_speech_to_text(ctx: StepContext, params: dict) -> dict:
     ctx.caption_text = text
     ctx.outputs["transcript_text"] = text
     ctx.outputs["srt_path"] = srt_path
+
+    # Update content_signature with transcript (more accurate)
+    _update_content_signature(ctx, text)
     
     return {
         "text": text[:500] + "..." if len(text) > 500 else text,
         "srt_path": srt_path,
         "txt_path": str(txt_files[0]) if txt_files else None,
     }
+
+
+def _update_content_signature(ctx: StepContext, transcript: str):
+    """Update content_signature on the publish task's linked candidate using transcript."""
+    if not transcript or not transcript.strip():
+        return
+    try:
+        from app.services.dedupe import compute_signature
+        sig = compute_signature(transcript)
+        if sig and hasattr(ctx, "publish_task") and ctx.publish_task:
+            task = ctx.publish_task
+            if hasattr(task, "candidate") and task.candidate:
+                meta = task.candidate.meta or {}
+                meta["content_signature"] = sig
+                meta["content_signature_source"] = "whisper"
+                task.candidate.meta = meta
+        ctx.outputs["content_signature"] = sig
+        ctx.outputs["content_signature_source"] = "whisper"
+    except Exception:
+        pass  # non-critical
 
 
 def _segments_to_srt(segments: list) -> str:

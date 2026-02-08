@@ -195,9 +195,18 @@ export default function ProjectFeedPage() {
         showToast(`Одобрено${platInfo} → задача #${data.task_id}`);
         loadFeed();
         setTimeout(() => router.push(`/queue/${data.task_id}`), 800);
+      } else if (res.status === 409) {
+        const err = await res.json().catch(() => ({ detail: {} }));
+        const detail = typeof err.detail === "object" ? err.detail : {};
+        if (detail.error === "duplicate" && detail.duplicate_candidate_id) {
+          showToast(`Дубликат кандидата #${detail.duplicate_candidate_id}`, "error");
+        } else {
+          showToast("Кандидат уже существует", "error");
+        }
       } else {
         const err = await res.json().catch(() => ({ detail: "Ошибка" }));
-        showToast(err.detail || "Ошибка одобрения", "error");
+        const msg = typeof err.detail === "string" ? err.detail : (err.detail?.message || "Ошибка одобрения");
+        showToast(msg, "error");
       }
     } catch {
       showToast("Сетевая ошибка", "error");
@@ -407,6 +416,28 @@ export default function ProjectFeedPage() {
                         ⚡ GEN
                       </div>
                     )}
+                    {(() => {
+                      const sig = c.meta?.content_signature as string | undefined;
+                      if (!sig || c.status === "APPROVED" || c.status === "USED") return null;
+                      const dup = candidates.find(
+                        o => o.id !== c.id
+                          && (o.meta?.content_signature as string) === sig
+                          && (o.status === "APPROVED" || o.status === "USED")
+                      );
+                      if (!dup) return null;
+                      return (
+                        <div
+                          style={{
+                            padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                            background: "#ef4444", color: "#fff", cursor: "pointer",
+                          }}
+                          title={`Дубликат кандидата #${dup.id}`}
+                          onClick={() => showToast(`Дубликат #${dup.id} (${dup.status})`, "error")}
+                        >
+                          DUP #{dup.id}
+                        </div>
+                      );
+                    })()}
                   </div>
                   {/* Virality score */}
                   <div style={{

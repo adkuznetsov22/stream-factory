@@ -187,6 +187,19 @@ async def run_auto_approve(
     skipped: list[dict] = []
 
     for candidate in candidates:
+        # ── Duplicate check via content_signature ─────────
+        sig = (candidate.meta or {}).get("content_signature")
+        if sig:
+            from app.services.dedupe import find_duplicate
+            dup = await find_duplicate(session, project_id, sig, exclude_candidate_id=candidate.id)
+            if dup:
+                skipped.append({
+                    "candidate_id": candidate.id,
+                    "score": candidate.virality_score,
+                    "reason": f"duplicate: same content as #{dup.id} (status={dup.status})",
+                })
+                continue
+
         # ── Check cooldown ───────────────────────────────
         ck = _cooldown_key(candidate)
         if ck and ck in cooldown_keys:

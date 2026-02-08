@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db import get_session
+from app.services.dedupe import compute_candidate_signature, find_duplicate
 from app.models import (
     Brief,
     Candidate,
@@ -156,6 +157,20 @@ async def approve_candidate(
 
     if candidate.status not in (CandidateStatus.new.value, CandidateStatus.rejected.value):
         raise HTTPException(status_code=400, detail=f"Cannot approve candidate with status {candidate.status}")
+
+    # Duplicate check via content_signature
+    sig = (candidate.meta or {}).get("content_signature")
+    if sig:
+        dup = await find_duplicate(session, project_id, sig, exclude_candidate_id=candidate.id)
+        if dup:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "duplicate",
+                    "duplicate_candidate_id": dup.id,
+                    "message": f"Duplicate of candidate #{dup.id} (status={dup.status})",
+                },
+            )
 
     # Get project with destinations
     res = await session.execute(
@@ -365,6 +380,15 @@ async def _upsert_candidate(
     )
     candidate.virality_score = _vr.score
     candidate.virality_factors = _vr.factors
+
+    # Compute content signature for deduplication
+    sig, sig_source = compute_candidate_signature(candidate)
+    if sig:
+        meta = candidate.meta or {}
+        meta["content_signature"] = sig
+        meta["content_signature_source"] = sig_source
+        candidate.meta = meta
+
     session.add(candidate)
     return candidate, is_new
 
