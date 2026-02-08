@@ -74,6 +74,18 @@ app.include_router(ops_router)
 @app.on_event("startup")
 async def startup_event():
     """Start scheduler on app startup (respects SCHEDULER_ENABLED)."""
+    # Preflight checks
+    try:
+        from app.services.preflight import run_preflight
+        pf = await run_preflight()
+        if pf["ok"]:
+            logger.info("Preflight checks: ALL OK")
+        else:
+            failed = [c["check"] for c in pf["checks"] if not c["ok"]]
+            logger.warning(f"Preflight checks FAILED: {failed}")
+    except Exception as e:
+        logger.warning(f"Preflight checks error: {e}")
+
     from app.services.scheduler import scheduler_service
     scheduler_service.configure(settings.database_url)
 

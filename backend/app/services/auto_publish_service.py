@@ -394,6 +394,16 @@ async def run_auto_publish(
             ))
         await session.commit()
 
+        # Notify on publish failures
+        try:
+            from app.services.notify import notify_error
+            failed = [s for s in started if not s.get("success", False)]
+            if failed:
+                summary = ", ".join(f"#{s['task_id']}: {s.get('error', '?')[:60]}" for s in failed[:5])
+                await notify_error(f"Publish fail: {len(failed)} tasks", summary)
+        except Exception:
+            pass
+
     logger.info(
         f"[auto_publish] Started {len(started)}, skipped {len(skipped)}, "
         f"dry_run={dry_run}"

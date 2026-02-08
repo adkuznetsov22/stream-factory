@@ -143,6 +143,13 @@ async def run_watchdog(
 
     if not dry_run and report_items:
         await session.commit()
+        # Notify about stuck tasks
+        try:
+            from app.services.notify import notify_warn
+            summary = ", ".join(f"#{it['task_id']}({it['old_status']} {it['age_minutes']}m)" for it in report_items[:10])
+            await notify_warn(f"Watchdog: {len(report_items)} stuck tasks", summary)
+        except Exception:
+            pass
 
     total = len(report_items)
     logger.info(f"[watchdog] Found {total} stuck tasks (dry_run={dry_run})")

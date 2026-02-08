@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     stuck_publishing_minutes: int = Field(default=30, validation_alias=AliasChoices("STUCK_PUBLISHING_MINUTES", "STREAM_FACTORY_STUCK_PUBLISHING_MINUTES"))
     watchdog_auto_requeue: bool = Field(default=False, validation_alias=AliasChoices("WATCHDOG_AUTO_REQUEUE", "STREAM_FACTORY_WATCHDOG_AUTO_REQUEUE"))
 
+    # Production hardening
+    app_env: str = Field(default="dev", validation_alias=AliasChoices("APP_ENV", "STREAM_FACTORY_APP_ENV"))
+    ops_api_key: str | None = Field(default=None, validation_alias=AliasChoices("OPS_API_KEY", "STREAM_FACTORY_OPS_API_KEY"))
+    backup_dir: str = Field(default="/app/backups", validation_alias=AliasChoices("BACKUP_DIR", "STREAM_FACTORY_BACKUP_DIR"))
+    backup_keep_last: int = Field(default=7, validation_alias=AliasChoices("BACKUP_KEEP_LAST", "STREAM_FACTORY_BACKUP_KEEP_LAST"))
+
     @property
     def async_database_url(self) -> str:
         if self.database_url.startswith("postgresql+"):

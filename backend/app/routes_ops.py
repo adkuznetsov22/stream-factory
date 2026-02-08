@@ -1,23 +1,37 @@
 """
 Operations endpoints — watchdog, health, system status, bulk task control.
+
+Security: in prod (APP_ENV=prod/staging), all /api/ops/* require X-Ops-Key header.
 """
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import Candidate, PublishTask, StepResult
+from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+def _ops_auth(x_ops_key: str | None = Header(default=None)):
+    """Security gate: require OPS_API_KEY in prod/staging."""
+    settings = get_settings()
+    if settings.app_env in ("prod", "staging") and settings.ops_api_key:
+        if x_ops_key != settings.ops_api_key:
+            raise HTTPException(status_code=403, detail="Invalid or missing X-Ops-Key")
+
+
+router = APIRouter(prefix="/api/ops", tags=["ops"], dependencies=[Depends(_ops_auth)])
 
 SessionDep = Depends(get_session)
 
@@ -46,9 +60,83 @@ async def run_watchdog_endpoint(
 async def health_endpoint(
     session: AsyncSession = SessionDep,
 ):
-    """System health overview: task counts, stuck tasks, scheduler status."""
+    """System health overview: task counts, stuck tasks, scheduler, preflight, limits."""
     from app.services.watchdog_service import get_health
-    return await get_health(session)
+    from app.services.preflight import run_preflight
+
+    base = await get_health(session)
+    settings = get_settings()
+
+    # Preflight checks (cached 60s)
+    preflight = await run_preflight()
+    base["preflight"] = preflight
+
+    # Queue depth (best-effort via Redis llen)
+    queue_depth = None
+    if settings.celery_enabled:
+        try:
+            import redis.asyncio as aioredis
+            r = aioredis.from_url(settings.redis_url, decode_responses=True)
+            queue_depth = await r.llen("pipeline")
+            await r.aclose()
+        except Exception:
+            queue_depth = -1
+    base["queue_depth"] = queue_depth
+
+    # Scheduler jobs status
+    base["scheduler_jobs"] = {
+        "auto_process": settings.auto_process_enabled,
+        "watchdog": settings.watchdog_enabled,
+        "scheduler": settings.scheduler_enabled,
+    }
+
+    # Limits / config
+    base["limits"] = {
+        "app_env": settings.app_env,
+        "auto_process_max_parallel": settings.auto_process_max_parallel,
+        "auto_process_max_parallel_per_destination": settings.auto_process_max_parallel_per_destination,
+        "auto_process_interval_minutes": settings.auto_process_interval_minutes,
+        "pipeline_default_step_timeout_sec": settings.pipeline_default_step_timeout_sec,
+        "pipeline_ffmpeg_timeout_sec": settings.pipeline_ffmpeg_timeout_sec,
+        "pipeline_whisper_timeout_sec": settings.pipeline_whisper_timeout_sec,
+        "max_ffmpeg_concurrency": settings.max_ffmpeg_concurrency,
+        "max_whisper_concurrency": settings.max_whisper_concurrency,
+        "redis_semaphore_ttl_sec": settings.redis_semaphore_ttl_sec,
+        "semaphore_wait_timeout_sec": settings.semaphore_wait_timeout_sec,
+        "stuck_processing_minutes": settings.stuck_processing_minutes,
+        "stuck_publishing_minutes": settings.stuck_publishing_minutes,
+    }
+
+    return base
+
+
+# ── Backups ──────────────────────────────────────────────────
+@router.get("/backups/latest")
+async def list_backups():
+    """List recent backup files."""
+    settings = get_settings()
+    backup_dir = Path(settings.backup_dir)
+    if not backup_dir.exists():
+        return {"backups": [], "backup_dir": str(backup_dir), "exists": False}
+
+    files = sorted(backup_dir.glob("*.sql*"), key=lambda f: f.stat().st_mtime, reverse=True)
+    items = []
+    for f in files[:settings.backup_keep_last + 5]:
+        st = f.stat()
+        items.append({
+            "name": f.name,
+            "size_mb": round(st.st_size / (1024 * 1024), 2),
+            "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        })
+    return {"backups": items, "backup_dir": str(backup_dir), "exists": True}
+
+
+@router.post("/backups/create")
+async def create_backup():
+    """Trigger a pg_dump backup manually."""
+    from app.services.backup import run_backup
+    result = await run_backup()
+    return result
 
 
 # ── Task list ────────────────────────────────────────────────
