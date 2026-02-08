@@ -35,6 +35,7 @@ LOCK_TASK_GENERATION = 900_001
 LOCK_SYNC_ACCOUNTS = 900_002
 LOCK_SYNC_PUBLISHED_METRICS = 900_003
 LOCK_AGGREGATE_SNAPSHOTS = 900_004
+LOCK_CALIBRATE_SCORING = 900_005
 
 
 class SchedulerService:
@@ -126,6 +127,14 @@ class SchedulerService:
             IntervalTrigger(hours=24),
             id="aggregate_snapshots",
             name="Aggregate old metric snapshots",
+            replace_existing=True,
+        )
+
+        self.scheduler.add_job(
+            self._run_calibrate_scoring,
+            IntervalTrigger(hours=24),
+            id="calibrate_scoring",
+            name="Calibrate scoring thresholds",
             replace_existing=True,
         )
         
@@ -266,6 +275,32 @@ class SchedulerService:
                 return result
             finally:
                 await self._release_advisory_lock(session, LOCK_AGGREGATE_SNAPSHOTS)
+
+    async def _run_calibrate_scoring(self):
+        """Calibrate scoring thresholds for all projects (daily).
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_CALIBRATE_SCORING)
+            if not acquired:
+                logger.debug("[calibrate_scoring] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[calibrate_scoring] LEADER — calibrating scoring thresholds")
+                from app.services.calibrate_scoring import calibrate_all_projects
+
+                result = await calibrate_all_projects(session)
+
+                logger.info(
+                    "[calibrate_scoring] Completed: %d calibrated, %d skipped",
+                    result.get("calibrated", 0),
+                    result.get("skipped", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_CALIBRATE_SCORING)
 
     async def _sync_account(self, session: AsyncSession, account):
         """Sync a single account based on platform."""

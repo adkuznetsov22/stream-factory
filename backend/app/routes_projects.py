@@ -1754,6 +1754,41 @@ def _age_bucket(hours: int) -> str:
     return "7d+"
 
 
+@router.get("/projects/{project_id}/analytics/calibration", response_model=dict)
+async def get_scoring_calibration(project_id: int, session: AsyncSession = SessionDep):
+    """Get cached scoring calibration for a project.
+
+    Returns the latest calibration result from project.meta,
+    or runs a fresh calibration if none exists.
+    """
+    from app.models import Project
+    project = await session.get(Project, project_id)
+    if not project:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    meta = project.meta or {}
+    cached = meta.get("scoring_calibration")
+    if cached:
+        return cached
+
+    # No cached result — run fresh
+    from app.services.calibrate_scoring import calibrate_project_scoring
+    return await calibrate_project_scoring(session, project_id)
+
+
+@router.post("/projects/{project_id}/analytics/calibrate", response_model=dict)
+async def run_scoring_calibration(project_id: int, session: AsyncSession = SessionDep):
+    """Force a fresh scoring calibration for a project.
+
+    Computes correlation virality_score vs views_per_hour,
+    determines auto_approve_threshold, and identifies which
+    virality_factors actually correlate with real performance.
+    """
+    from app.services.calibrate_scoring import calibrate_project_scoring
+    return await calibrate_project_scoring(session, project_id)
+
+
 @router.get("/export-profiles", response_model=list[ExportProfileRead])
 async def list_export_profiles(session: AsyncSession = SessionDep):
     """Список всех доступных export-профилей."""
