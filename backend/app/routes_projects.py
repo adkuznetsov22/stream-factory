@@ -1803,6 +1803,41 @@ async def cancel_task(task_id: int, session: AsyncSession = SessionDep, reason: 
     return {"ok": True, "task_id": task_id, "status": task.status, "revoked": revoked, "cancel_requested_at": task.cancel_requested_at.isoformat() if task.cancel_requested_at else None}
 
 
+# ── Daily Publish Plan ────────────────────────────────────────
+
+@router.get("/projects/{project_id}/publish-plan", response_model=dict)
+async def get_publish_plan(
+    project_id: int,
+    date: str | None = Query(default=None),
+    destination_id: int | None = Query(default=None),
+    max_items: int = Query(default=20, ge=1, le=100),
+    session: AsyncSession = SessionDep,
+):
+    """Compute daily publish plan (dry-run, no mutations)."""
+    from app.services.daily_plan_service import compute_plan
+    return await compute_plan(
+        session, project_id,
+        date_str=date, destination_id=destination_id, max_items=max_items,
+    )
+
+
+@router.post("/projects/{project_id}/publish-plan/apply", response_model=dict)
+async def apply_publish_plan(
+    project_id: int,
+    body: dict | None = None,
+    session: AsyncSession = SessionDep,
+):
+    """Apply plan: set priorities (+ optional enqueue)."""
+    from app.services.daily_plan_service import apply_plan
+    body = body or {}
+    return await apply_plan(
+        session, project_id,
+        date_str=body.get("date"),
+        base_priority=body.get("base_priority", 10),
+        enqueue=body.get("enqueue", False),
+    )
+
+
 @router.post("/publish-tasks/{task_id}/process-v2", response_model=dict)
 async def process_task_v2(task_id: int, session: AsyncSession = SessionDep):
     """
