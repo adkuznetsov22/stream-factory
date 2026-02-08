@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = Field(default=None, validation_alias=AliasChoices("TELEGRAM_BOT_TOKEN", "STREAM_FACTORY_TELEGRAM_BOT_TOKEN"))
     telegram_chat_id: str | None = Field(default=None, validation_alias=AliasChoices("TELEGRAM_CHAT_ID", "STREAM_FACTORY_TELEGRAM_CHAT_ID"))
     admin_password: str | None = Field(default=None, validation_alias=AliasChoices("ADMIN_PASSWORD", "STREAM_FACTORY_ADMIN_PASSWORD"))
+    scheduler_enabled: bool = Field(default=True, validation_alias=AliasChoices("SCHEDULER_ENABLED", "STREAM_FACTORY_SCHEDULER_ENABLED"))
 
     @property
     def async_database_url(self) -> str:

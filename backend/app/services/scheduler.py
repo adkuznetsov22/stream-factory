@@ -5,18 +5,24 @@ Manages automatic task generation for projects:
 - Runs periodic jobs for active AUTO-mode projects
 - Configurable intervals per project
 - Sync scheduling for all platforms
+
+Single-leader election via Postgres advisory locks:
+- Only the instance that acquires the lock executes the tick
+- Other instances silently skip
+- Controlled by SCHEDULER_ENABLED env (default: true)
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from app.models import Project
@@ -24,9 +30,18 @@ from app.settings import get_settings
 
 logger = logging.getLogger("scheduler")
 
+# Advisory lock keys (arbitrary int64 — unique per job type)
+LOCK_TASK_GENERATION = 900_001
+LOCK_SYNC_ACCOUNTS = 900_002
+
 
 class SchedulerService:
-    """Service for scheduling automatic task generation."""
+    """Service for scheduling automatic task generation.
+
+    Uses Postgres pg_try_advisory_lock on each tick so that only
+    one backend instance (the leader) executes the job while
+    other instances skip silently.
+    """
     
     _instance: "SchedulerService | None" = None
     
@@ -34,6 +49,7 @@ class SchedulerService:
         self.scheduler = AsyncIOScheduler()
         self._session_factory: async_sessionmaker | None = None
         self._running = False
+        self._leader_logged = False
     
     @classmethod
     def get_instance(cls) -> "SchedulerService":
@@ -54,8 +70,27 @@ class SchedulerService:
             self.configure(settings.database_url)
         return self._session_factory()
     
+    async def _try_advisory_lock(self, session: AsyncSession, lock_key: int) -> bool:
+        """Try to acquire a Postgres session-level advisory lock (non-blocking).
+
+        Returns True if this instance acquired the lock (is leader for this tick).
+        The lock is automatically released when the session/connection closes.
+        """
+        result = await session.execute(text(f"SELECT pg_try_advisory_lock({lock_key})"))
+        acquired = result.scalar()
+        return bool(acquired)
+
+    async def _release_advisory_lock(self, session: AsyncSession, lock_key: int):
+        """Explicitly release advisory lock after job completion."""
+        await session.execute(text(f"SELECT pg_advisory_unlock({lock_key})"))
+
     def start(self):
-        """Start the scheduler."""
+        """Start the scheduler (respects SCHEDULER_ENABLED env)."""
+        settings = get_settings()
+        if not settings.scheduler_enabled:
+            logger.info("Scheduler DISABLED by SCHEDULER_ENABLED=false — skipping start")
+            return
+
         if self._running:
             return
         
@@ -78,7 +113,7 @@ class SchedulerService:
         
         self.scheduler.start()
         self._running = True
-        logger.info("Scheduler started")
+        logger.info("Scheduler started (single-leader mode via advisory locks)")
     
     def stop(self):
         """Stop the scheduler."""
@@ -93,54 +128,74 @@ class SchedulerService:
         return self._running
     
     async def _run_task_generation(self):
-        """Run task generation for all active AUTO projects."""
-        logger.info("Running scheduled task generation")
-        
+        """Run task generation for all active AUTO projects.
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
         async with await self._get_session() as session:
-            from app.services.task_generator import TaskGeneratorService
-            
-            generator = TaskGeneratorService(session)
-            result = await generator.generate_for_all_active_projects()
-            
-            logger.info(
-                "Task generation completed: %d projects processed",
-                result.get("projects_processed", 0)
-            )
-            return result
+            acquired = await self._try_advisory_lock(session, LOCK_TASK_GENERATION)
+            if not acquired:
+                logger.debug("[task_generation] Advisory lock not acquired — another instance is leader, skipping tick")
+                return None
+
+            try:
+                logger.info("[task_generation] LEADER — running task generation")
+                from app.services.task_generator import TaskGeneratorService
+
+                generator = TaskGeneratorService(session)
+                result = await generator.generate_for_all_active_projects()
+
+                logger.info(
+                    "[task_generation] Completed: %d projects processed",
+                    result.get("projects_processed", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_TASK_GENERATION)
     
     async def _run_sync_accounts(self):
-        """Sync all source accounts for active projects."""
-        logger.info("Running scheduled account sync")
-        
+        """Sync all source accounts for active projects.
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
         async with await self._get_session() as session:
-            from app.models import ProjectSource, SocialAccount
-            
-            # Get all active sources
-            result = await session.execute(
-                select(ProjectSource, SocialAccount, Project)
-                .join(SocialAccount, ProjectSource.social_account_id == SocialAccount.id)
-                .join(Project, ProjectSource.project_id == Project.id)
-                .where(
-                    ProjectSource.is_active == True,
-                    Project.status == "active",
-                    Project.mode == "AUTO",
+            acquired = await self._try_advisory_lock(session, LOCK_SYNC_ACCOUNTS)
+            if not acquired:
+                logger.debug("[sync_accounts] Advisory lock not acquired — another instance is leader, skipping tick")
+                return None
+
+            try:
+                logger.info("[sync_accounts] LEADER — running account sync")
+                from app.models import ProjectSource, SocialAccount
+
+                # Get all active sources
+                result = await session.execute(
+                    select(ProjectSource, SocialAccount, Project)
+                    .join(SocialAccount, ProjectSource.social_account_id == SocialAccount.id)
+                    .join(Project, ProjectSource.project_id == Project.id)
+                    .where(
+                        ProjectSource.is_active == True,
+                        Project.status == "active",
+                        Project.mode == "AUTO",
+                    )
                 )
-            )
-            
-            sources = result.fetchall()
-            synced = 0
-            errors = []
-            
-            for source, account, project in sources:
-                try:
-                    await self._sync_account(session, account)
-                    synced += 1
-                except Exception as e:
-                    logger.error("Failed to sync account %d: %s", account.id, e)
-                    errors.append({"account_id": account.id, "error": str(e)})
-            
-            logger.info("Account sync completed: %d synced, %d errors", synced, len(errors))
-            return {"synced": synced, "errors": errors}
+
+                sources = result.fetchall()
+                synced = 0
+                errors = []
+
+                for source, account, project in sources:
+                    try:
+                        await self._sync_account(session, account)
+                        synced += 1
+                    except Exception as e:
+                        logger.error("Failed to sync account %d: %s", account.id, e)
+                        errors.append({"account_id": account.id, "error": str(e)})
+
+                logger.info("[sync_accounts] Completed: %d synced, %d errors", synced, len(errors))
+                return {"synced": synced, "errors": errors}
+            finally:
+                await self._release_advisory_lock(session, LOCK_SYNC_ACCOUNTS)
     
     async def _sync_account(self, session: AsyncSession, account):
         """Sync a single account based on platform."""
