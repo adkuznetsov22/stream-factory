@@ -9,6 +9,24 @@ type Policy = {
   require_hook_rewrite?: boolean;
 };
 
+type FeedSettings = {
+  auto_approve_enabled?: boolean;
+  daily_limit_per_destination?: number;
+  cooldown_hours_per_source?: number;
+  min_score_override?: number | null;
+};
+
+type AutoApproveReport = {
+  threshold: number;
+  approved_count: number;
+  skipped_count: number;
+  approved: { candidate_id: number; task_id: number; score: number; title?: string; destination_platform?: string }[];
+  skipped: { candidate_id: number; score: number; reason: string }[];
+  daily_limits?: Record<string, { platform: string; used: number; limit: number }>;
+  run_at?: string;
+  error?: string;
+};
+
 type Project = {
   id: number;
   name: string;
@@ -18,6 +36,7 @@ type Project = {
   preset_id?: number | null;
   export_profile_id?: number | null;
   policy?: Policy | null;
+  feed_settings?: FeedSettings | null;
 };
 
 type Source = { id: number; platform: string; social_account_id: number };
@@ -25,6 +44,143 @@ type Destination = { id: number; platform: string; social_account_id: number; pr
 type Account = { id: number; platform: string; label: string };
 type Preset = { id: number; name: string };
 type ExportProfileItem = { id: number; name: string; target_platform: string; max_duration_sec: number; width: number; height: number; fps: number; codec: string };
+
+function AutoApproveBlock({
+  project, onUpdate, report, running, onRunNow,
+}: {
+  project: Project;
+  onUpdate: (fs: FeedSettings) => void;
+  report: AutoApproveReport | null;
+  running: boolean;
+  onRunNow: () => void;
+}) {
+  const fs: FeedSettings = project.feed_settings || {};
+  const enabled = fs.auto_approve_enabled ?? false;
+  const dailyLimit = fs.daily_limit_per_destination ?? 3;
+  const cooldown = fs.cooldown_hours_per_source ?? 12;
+  const scoreOverride = fs.min_score_override ?? null;
+
+  const set = (patch: Partial<FeedSettings>) => onUpdate({ ...fs, ...patch });
+
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <span style={{ fontWeight: 600, fontSize: 14, display: "block", marginBottom: 12 }}>Auto-Approve</span>
+      <div style={{
+        background: enabled ? "#22c55e08" : "var(--bg-muted)",
+        border: `1px solid ${enabled ? "#22c55e40" : "var(--border)"}`,
+        borderRadius: 10, padding: 16,
+      }}>
+        {/* Toggle */}
+        <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", marginBottom: 12 }}>
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={e => set({ auto_approve_enabled: e.target.checked })}
+          />
+          <span style={{ fontSize: 13, fontWeight: 500 }}>
+            Автоматически одобрять кандидатов по порогу скоринга
+          </span>
+        </label>
+
+        {enabled && (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>
+                  Лимит / назначение / день
+                </label>
+                <input
+                  type="number" min={1} max={50} value={dailyLimit}
+                  onChange={e => set({ daily_limit_per_destination: Number(e.target.value) || 3 })}
+                  style={{ width: "100%" }}
+                />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>
+                  Cooldown автора (часы)
+                </label>
+                <input
+                  type="number" min={0} max={168} value={cooldown}
+                  onChange={e => set({ cooldown_hours_per_source: Number(e.target.value) || 12 })}
+                  style={{ width: "100%" }}
+                />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>
+                  Мин. score (override)
+                </label>
+                <input
+                  type="number" min={0} max={100} step={0.01}
+                  value={scoreOverride ?? ""}
+                  placeholder="из калибровки"
+                  onChange={e => set({ min_score_override: e.target.value ? Number(e.target.value) : null })}
+                  style={{ width: "100%" }}
+                />
+              </div>
+            </div>
+
+            {/* Run Now button */}
+            <button
+              onClick={onRunNow}
+              disabled={running}
+              style={{
+                padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
+                background: running ? "var(--bg-muted)" : "#22c55e20",
+                color: running ? "var(--fg-subtle)" : "#22c55e",
+                border: "1px solid #22c55e40",
+              }}
+            >
+              {running ? "Запуск..." : "▶ Запустить сейчас"}
+            </button>
+
+            {/* Report */}
+            {report && (
+              <div style={{ marginTop: 12, padding: 12, background: "var(--bg-subtle)", borderRadius: 8, border: "1px solid var(--border)" }}>
+                <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12 }}>
+                  <span>Порог: <strong>{report.threshold?.toFixed(2)}</strong></span>
+                  <span style={{ color: "#22c55e" }}>Одобрено: <strong>{report.approved_count}</strong></span>
+                  <span style={{ color: "#ef4444" }}>Пропущено: <strong>{report.skipped_count}</strong></span>
+                  {report.run_at && <span style={{ color: "var(--fg-subtle)" }}>{new Date(report.run_at).toLocaleTimeString("ru")}</span>}
+                </div>
+                {report.error && (
+                  <div style={{ color: "#ef4444", fontSize: 12, marginBottom: 8 }}>{report.error}</div>
+                )}
+                {report.approved.length > 0 && (
+                  <div style={{ fontSize: 11, marginBottom: 6 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>Одобрены:</div>
+                    {report.approved.map(a => (
+                      <div key={a.candidate_id} style={{ display: "flex", gap: 8, padding: "2px 0" }}>
+                        <span style={{ color: "#22c55e" }}>✓</span>
+                        <span>{a.title || `#${a.candidate_id}`}</span>
+                        <span style={{ color: "var(--fg-subtle)" }}>score={a.score?.toFixed(2)}</span>
+                        {a.destination_platform && <span style={{ color: "var(--fg-subtle)" }}>→ {a.destination_platform}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {report.skipped.length > 0 && (
+                  <div style={{ fontSize: 11 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4, color: "var(--fg-subtle)" }}>Пропущены:</div>
+                    {report.skipped.slice(0, 5).map(s => (
+                      <div key={s.candidate_id} style={{ display: "flex", gap: 8, padding: "2px 0", color: "var(--fg-subtle)" }}>
+                        <span>✕</span>
+                        <span>#{s.candidate_id} (score={s.score?.toFixed(2)})</span>
+                        <span style={{ fontSize: 10 }}>{s.reason}</span>
+                      </div>
+                    ))}
+                    {report.skipped.length > 5 && (
+                      <div style={{ color: "var(--fg-subtle)", fontSize: 10 }}>...и ещё {report.skipped.length - 5}</div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export default function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -37,6 +193,8 @@ export default function ProjectsPage() {
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({ name: "", mode: "MANUAL", preset_id: "" });
+  const [aaReport, setAaReport] = useState<AutoApproveReport | null>(null);
+  const [aaRunning, setAaRunning] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -300,6 +458,22 @@ export default function ProjectsPage() {
                         ))}
                       </div>
                     </div>
+
+                    {/* Auto-Approve */}
+                    <AutoApproveBlock
+                      project={p}
+                      onUpdate={(fs) => updateProject(p.id, { feed_settings: fs } as any)}
+                      report={expanded === p.id ? aaReport : null}
+                      running={aaRunning}
+                      onRunNow={async () => {
+                        setAaRunning(true);
+                        setAaReport(null);
+                        const res = await fetch(`/api/projects/${p.id}/auto-approve`, { method: "POST" });
+                        if (res.ok) setAaReport(await res.json());
+                        setAaRunning(false);
+                        load();
+                      }}
+                    />
 
                     {/* Sources */}
                     <div style={{ marginBottom: 24 }}>

@@ -36,6 +36,7 @@ LOCK_SYNC_ACCOUNTS = 900_002
 LOCK_SYNC_PUBLISHED_METRICS = 900_003
 LOCK_AGGREGATE_SNAPSHOTS = 900_004
 LOCK_CALIBRATE_SCORING = 900_005
+LOCK_AUTO_APPROVE = 900_006
 
 
 class SchedulerService:
@@ -135,6 +136,14 @@ class SchedulerService:
             IntervalTrigger(hours=24),
             id="calibrate_scoring",
             name="Calibrate scoring thresholds",
+            replace_existing=True,
+        )
+
+        self.scheduler.add_job(
+            self._run_auto_approve,
+            IntervalTrigger(minutes=60),
+            id="auto_approve",
+            name="Auto-approve candidates",
             replace_existing=True,
         )
         
@@ -301,6 +310,32 @@ class SchedulerService:
                 return result
             finally:
                 await self._release_advisory_lock(session, LOCK_CALIBRATE_SCORING)
+
+    async def _run_auto_approve(self):
+        """Auto-approve candidates for all enabled projects (hourly).
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_AUTO_APPROVE)
+            if not acquired:
+                logger.debug("[auto_approve] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[auto_approve] LEADER — running auto-approve")
+                from app.services.auto_approve_service import run_auto_approve_all
+
+                result = await run_auto_approve_all(session)
+
+                logger.info(
+                    "[auto_approve] Completed: %d projects, %d total approved",
+                    result.get("processed", 0),
+                    result.get("total_approved", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_AUTO_APPROVE)
 
     async def _sync_account(self, session: AsyncSession, account):
         """Sync a single account based on platform."""

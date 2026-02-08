@@ -455,6 +455,8 @@ class Project(Base):
     mode: Mapped[str] = mapped_column(sa.Text(), nullable=False, server_default="MANUAL")
     settings_json: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
     policy: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    meta: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    feed_settings: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
     export_profile_id: Mapped[int | None] = mapped_column(
         sa.ForeignKey("export_profiles.id", ondelete="SET NULL"), nullable=True
     )

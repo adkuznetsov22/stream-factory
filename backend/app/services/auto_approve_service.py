@@ -1,0 +1,278 @@
+"""
+Auto-approve engine for candidates.
+
+Uses scoring calibration threshold (or manual override) to automatically
+approve high-scoring candidates and create PublishTasks, respecting
+daily limits per destination and cooldown per source author.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import select, and_, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.models import (
+    Candidate, CandidateOrigin, CandidateStatus,
+    Project, ProjectDestination, PublishTask, Brief,
+)
+
+logger = logging.getLogger(__name__)
+
+# Defaults when feed_settings keys are missing
+DEFAULT_DAILY_LIMIT = 3
+DEFAULT_COOLDOWN_HOURS = 12
+MAX_CANDIDATES_PER_RUN = 50
+
+
+def _get_feed_settings(project: Project) -> dict:
+    """Extract feed_settings with defaults."""
+    fs = project.feed_settings or {}
+    return {
+        "auto_approve_enabled": fs.get("auto_approve_enabled", False),
+        "daily_limit_per_destination": fs.get("daily_limit_per_destination", DEFAULT_DAILY_LIMIT),
+        "cooldown_hours_per_source": fs.get("cooldown_hours_per_source", DEFAULT_COOLDOWN_HOURS),
+        "min_score_override": fs.get("min_score_override"),
+    }
+
+
+def _get_threshold(project: Project, settings: dict) -> float:
+    """Determine the score threshold for auto-approve.
+
+    Priority:
+    1. min_score_override from feed_settings (operator override)
+    2. auto_approve_threshold from scoring calibration
+    3. Fallback 0.70
+    """
+    override = settings.get("min_score_override")
+    if override is not None and isinstance(override, (int, float)):
+        return float(override)
+
+    meta = project.meta or {}
+    calibration = meta.get("scoring_calibration", {})
+    cal_threshold = calibration.get("auto_approve_threshold")
+    if cal_threshold is not None:
+        return float(cal_threshold)
+
+    return 0.70
+
+
+async def run_auto_approve(
+    session: AsyncSession, project_id: int
+) -> dict[str, Any]:
+    """Auto-approve candidates for a project based on scoring threshold.
+
+    Returns report dict:
+    {
+        approved: [{candidate_id, task_id, destination_id, score}],
+        skipped: [{candidate_id, reason}],
+        threshold, daily_limits_used, ...
+    }
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── Load project with destinations ───────────────────────
+    res = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .options(selectinload(Project.destinations))
+    )
+    project = res.scalar_one_or_none()
+    if not project:
+        return {"error": "Project not found", "approved": [], "skipped": []}
+
+    settings = _get_feed_settings(project)
+    threshold = _get_threshold(project, settings)
+    daily_limit = settings["daily_limit_per_destination"]
+    cooldown_hours = settings["cooldown_hours_per_source"]
+
+    active_dests = [d for d in project.destinations if d.is_active]
+    if not active_dests:
+        return {
+            "error": "No active destinations",
+            "approved": [], "skipped": [],
+            "threshold": threshold,
+        }
+
+    # ── Count today's tasks per destination ──────────────────
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_counts: dict[int, int] = {}
+    for dest in active_dests:
+        count_q = await session.execute(
+            select(func.count(PublishTask.id)).where(and_(
+                PublishTask.project_id == project_id,
+                PublishTask.destination_social_account_id == dest.social_account_id,
+                PublishTask.created_at >= day_start,
+            ))
+        )
+        daily_counts[dest.id] = count_q.scalar() or 0
+
+    # ── Cooldown: recently approved authors ──────────────────
+    cooldown_cutoff = now - timedelta(hours=cooldown_hours)
+    recent_authors_q = await session.execute(
+        select(Candidate.author).where(and_(
+            Candidate.project_id == project_id,
+            Candidate.status == CandidateStatus.approved.value,
+            Candidate.reviewed_at >= cooldown_cutoff,
+            Candidate.author.isnot(None),
+        )).distinct()
+    )
+    cooldown_authors = {r[0] for r in recent_authors_q.all()}
+
+    # ── Fetch eligible candidates ────────────────────────────
+    candidates_q = await session.execute(
+        select(Candidate)
+        .where(and_(
+            Candidate.project_id == project_id,
+            Candidate.status == CandidateStatus.new.value,
+            Candidate.virality_score.isnot(None),
+            Candidate.virality_score >= threshold,
+            Candidate.linked_publish_task_id.is_(None),
+        ))
+        .order_by(Candidate.virality_score.desc())
+        .limit(MAX_CANDIDATES_PER_RUN)
+    )
+    candidates = candidates_q.scalars().all()
+
+    approved: list[dict] = []
+    skipped: list[dict] = []
+
+    for candidate in candidates:
+        # ── Check cooldown ───────────────────────────────
+        if candidate.author and candidate.author in cooldown_authors:
+            skipped.append({
+                "candidate_id": candidate.id,
+                "score": candidate.virality_score,
+                "reason": f"cooldown: author '{candidate.author}' approved within {cooldown_hours}h",
+            })
+            continue
+
+        # ── Find best destination with remaining budget ──
+        best_dest = None
+        for dest in active_dests:
+            if daily_counts.get(dest.id, 0) < daily_limit:
+                best_dest = dest
+                break
+
+        if not best_dest:
+            skipped.append({
+                "candidate_id": candidate.id,
+                "score": candidate.virality_score,
+                "reason": "daily_limit: all destinations exhausted",
+            })
+            continue
+
+        # ── Create PublishTask (same flow as manual approve) ─
+        is_generate = candidate.origin == CandidateOrigin.generate.value
+        task_meta = None
+        if is_generate and candidate.brief_id:
+            brief = await session.get(Brief, candidate.brief_id)
+            if brief:
+                task_meta = {
+                    "origin": "GENERATE",
+                    "candidate_meta": candidate.meta or {},
+                    "brief": {
+                        "id": brief.id,
+                        "title": brief.title,
+                        "topic": brief.topic,
+                        "style": brief.style,
+                        "tone": brief.tone,
+                        "language": brief.language,
+                        "target_duration_sec": brief.target_duration_sec,
+                        "target_platform": brief.target_platform,
+                        "llm_prompt_template": brief.llm_prompt_template,
+                    },
+                }
+
+        task = PublishTask(
+            project_id=project_id,
+            platform=best_dest.platform,
+            destination_social_account_id=best_dest.social_account_id,
+            external_id=candidate.platform_video_id,
+            permalink=candidate.url if not is_generate else None,
+            preview_url=candidate.thumbnail_url,
+            download_url=candidate.url if not is_generate else None,
+            caption_text=candidate.caption or candidate.title,
+            status="queued",
+            preset_id=project.preset_id,
+            total_steps=0,
+            artifacts=task_meta,
+        )
+        session.add(task)
+        await session.flush()
+
+        # Link candidate
+        candidate.status = CandidateStatus.approved.value
+        candidate.linked_publish_task_id = task.id
+        candidate.reviewed_at = now
+        session.add(candidate)
+
+        # Update counters
+        daily_counts[best_dest.id] = daily_counts.get(best_dest.id, 0) + 1
+        if candidate.author:
+            cooldown_authors.add(candidate.author)
+
+        approved.append({
+            "candidate_id": candidate.id,
+            "task_id": task.id,
+            "destination_id": best_dest.id,
+            "destination_platform": best_dest.platform,
+            "score": candidate.virality_score,
+            "title": candidate.title,
+        })
+
+    await session.commit()
+
+    report = {
+        "project_id": project_id,
+        "threshold": round(threshold, 4),
+        "approved_count": len(approved),
+        "skipped_count": len(skipped),
+        "approved": approved,
+        "skipped": skipped,
+        "daily_limits": {
+            dest.id: {"platform": dest.platform, "used": daily_counts.get(dest.id, 0), "limit": daily_limit}
+            for dest in active_dests
+        },
+        "settings": settings,
+        "run_at": now.isoformat(),
+    }
+
+    logger.info(
+        f"[auto_approve] Project {project_id}: "
+        f"{len(approved)} approved, {len(skipped)} skipped, "
+        f"threshold={threshold:.2f}"
+    )
+    return report
+
+
+async def run_auto_approve_all(session: AsyncSession) -> dict:
+    """Run auto-approve for all projects with auto_approve_enabled=true."""
+    # SQLAlchemy JSON field query for feed_settings->auto_approve_enabled
+    projects_q = await session.execute(
+        select(Project.id).where(
+            Project.feed_settings["auto_approve_enabled"].as_boolean() == True  # noqa: E712
+        )
+    )
+    project_ids = [r[0] for r in projects_q.all()]
+
+    if not project_ids:
+        logger.info("[auto_approve] No projects with auto_approve_enabled")
+        return {"processed": 0, "total_approved": 0}
+
+    total_approved = 0
+    for pid in project_ids:
+        try:
+            report = await run_auto_approve(session, pid)
+            total_approved += report.get("approved_count", 0)
+        except Exception as e:
+            logger.error(f"[auto_approve] Project {pid} failed: {e}")
+
+    logger.info(
+        f"[auto_approve] Done: {len(project_ids)} projects, "
+        f"{total_approved} total approved"
+    )
+    return {"processed": len(project_ids), "total_approved": total_approved}
