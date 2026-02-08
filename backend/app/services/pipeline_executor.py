@@ -1560,6 +1560,360 @@ def _format_ass_time(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
+# ============== Analysis Tools (A-series) ==============
+
+@PipelineExecutor.register("A01_SCRIPT_ANALYSIS")
+async def handle_script_analysis(ctx: StepContext, params: dict) -> dict:
+    """Analyze Whisper transcript to extract reusable script patterns.
+
+    Extracts from the transcript:
+    - hook: opening line / attention grabber (first ~3 seconds)
+    - structure: temporal breakdown (intro / body segments / outro)
+    - theses: key talking points / main ideas
+    - cta: call-to-action phrases
+    - retention_pattern: content density over time (where engagement peaks)
+
+    Saves result to candidate.meta.script_analysis (via ctx.session)
+    and ctx.outputs["script_analysis"] for downstream G01_SCRIPT.
+    """
+    import re as _re
+
+    # ── Gather transcript ────────────────────────────────────
+    transcript_text = (
+        ctx.outputs.get("transcript_text")
+        or ctx.caption_text
+        or ""
+    )
+    segments = ctx.outputs.get("transcript_segments") or []
+
+    if not transcript_text and not segments:
+        # Try reading from file
+        txt_path = ctx.task_dir / "whisper_out" / "transcript.txt"
+        if txt_path.exists():
+            transcript_text = txt_path.read_text(encoding="utf-8")
+        json_path = ctx.task_dir / "whisper_out" / "transcript.json"
+        if json_path.exists():
+            import json as _json
+            raw = _json.loads(json_path.read_text(encoding="utf-8"))
+            segments = raw.get("segments", [])
+            if not transcript_text:
+                transcript_text = raw.get("text", "")
+
+    if not transcript_text:
+        raise RuntimeError("A01_SCRIPT_ANALYSIS: no transcript found — run T08_SPEECH_TO_TEXT first")
+
+    # ── Compute total duration ───────────────────────────────
+    total_duration = 0.0
+    if segments:
+        total_duration = max((s.get("end", 0) for s in segments), default=0)
+    if not total_duration:
+        # Estimate from probe data
+        total_duration = float(ctx.outputs.get("duration") or 60)
+
+    # ── 1. Hook (first ~3 seconds) ───────────────────────────
+    hook_text = ""
+    if segments:
+        hook_segs = [s for s in segments if s.get("start", 0) < 3.5]
+        hook_text = " ".join(s.get("text", "").strip() for s in hook_segs).strip()
+    if not hook_text:
+        # Fallback: first sentence
+        sentences = _split_sentences(transcript_text)
+        hook_text = sentences[0] if sentences else transcript_text[:100]
+
+    # ── 2. Structure (temporal breakdown) ────────────────────
+    structure = _analyze_structure(segments, total_duration)
+
+    # ── 3. Theses (key talking points) ───────────────────────
+    sentences = _split_sentences(transcript_text)
+    theses = _extract_theses(sentences, max_theses=params.get("max_theses", 5))
+
+    # ── 4. CTA detection ────────────────────────────────────
+    cta = _detect_cta(segments, sentences, total_duration)
+
+    # ── 5. Retention pattern ────────────────────────────────
+    retention = _analyze_retention(segments, total_duration)
+
+    # ── Build result ────────────────────────────────────────
+    analysis = {
+        "hook": hook_text,
+        "structure": structure,
+        "theses": theses,
+        "cta": cta,
+        "retention_pattern": retention,
+        "total_duration_sec": round(total_duration, 1),
+        "transcript_length": len(transcript_text),
+        "segments_count": len(segments),
+    }
+
+    # Save to file
+    analysis_path = ctx.task_dir / "script_analysis.json"
+    analysis_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Store in context for G01_SCRIPT
+    ctx.outputs["script_analysis"] = analysis
+
+    # Persist to candidate.meta if session available
+    if ctx.session and ctx.publish_task:
+        try:
+            from app.models import Candidate
+            from sqlalchemy import select as _select
+            cand_q = await ctx.session.execute(
+                _select(Candidate).where(
+                    Candidate.linked_publish_task_id == ctx.publish_task.id
+                )
+            )
+            candidate = cand_q.scalar_one_or_none()
+            if candidate:
+                meta = candidate.meta or {}
+                meta["script_analysis"] = analysis
+                candidate.meta = meta
+                ctx.session.add(candidate)
+                await ctx.session.commit()
+                ctx.log(f"[A01] Saved script_analysis to candidate #{candidate.id}.meta")
+        except Exception as e:
+            ctx.log(f"[A01] Could not save to candidate.meta: {e}")
+
+    ctx.log(
+        f"[A01] Analysis: hook={len(hook_text)}ch, "
+        f"{len(structure['blocks'])} blocks, {len(theses)} theses, "
+        f"CTA={'yes' if cta['detected'] else 'no'}, "
+        f"retention_zones={len(retention['zones'])}"
+    )
+
+    return {
+        "path": str(analysis_path),
+        "hook": hook_text[:200],
+        "blocks_count": len(structure["blocks"]),
+        "theses_count": len(theses),
+        "cta_detected": cta["detected"],
+        "retention_zones": len(retention["zones"]),
+    }
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences."""
+    import re as _re
+    raw = _re.split(r'(?<=[.!?…])\s+', text.strip())
+    return [s.strip() for s in raw if s.strip() and len(s.strip()) > 3]
+
+
+def _analyze_structure(segments: list, total_duration: float) -> dict:
+    """Break transcript into temporal blocks: intro, body parts, outro."""
+    if not segments or total_duration <= 0:
+        return {"blocks": [], "pattern": "unknown"}
+
+    # Define time boundaries
+    intro_end = min(total_duration * 0.1, 5.0)
+    outro_start = max(total_duration * 0.85, total_duration - 8.0)
+
+    blocks = []
+
+    # Intro
+    intro_segs = [s for s in segments if s.get("end", 0) <= intro_end + 1]
+    if intro_segs:
+        blocks.append({
+            "type": "intro",
+            "start_sec": 0,
+            "end_sec": round(intro_end, 1),
+            "text": " ".join(s.get("text", "").strip() for s in intro_segs),
+            "word_count": sum(len(s.get("text", "").split()) for s in intro_segs),
+        })
+
+    # Body — split into chunks of ~15 seconds
+    body_segs = [
+        s for s in segments
+        if s.get("start", 0) >= intro_end and s.get("end", 0) <= outro_start
+    ]
+    if body_segs:
+        chunk_dur = 15.0
+        chunk_start = intro_end
+        chunk_idx = 0
+        while chunk_start < outro_start:
+            chunk_end = min(chunk_start + chunk_dur, outro_start)
+            chunk_texts = [
+                s for s in body_segs
+                if s.get("start", 0) >= chunk_start - 0.5 and s.get("start", 0) < chunk_end
+            ]
+            if chunk_texts:
+                blocks.append({
+                    "type": "body",
+                    "index": chunk_idx,
+                    "start_sec": round(chunk_start, 1),
+                    "end_sec": round(chunk_end, 1),
+                    "text": " ".join(s.get("text", "").strip() for s in chunk_texts),
+                    "word_count": sum(len(s.get("text", "").split()) for s in chunk_texts),
+                })
+                chunk_idx += 1
+            chunk_start = chunk_end
+
+    # Outro
+    outro_segs = [s for s in segments if s.get("start", 0) >= outro_start - 0.5]
+    if outro_segs:
+        blocks.append({
+            "type": "outro",
+            "start_sec": round(outro_start, 1),
+            "end_sec": round(total_duration, 1),
+            "text": " ".join(s.get("text", "").strip() for s in outro_segs),
+            "word_count": sum(len(s.get("text", "").split()) for s in outro_segs),
+        })
+
+    # Classify pattern
+    body_count = sum(1 for b in blocks if b["type"] == "body")
+    pattern = "unknown"
+    if body_count <= 1:
+        pattern = "single_point"
+    elif body_count <= 3:
+        pattern = "listicle_short"
+    elif body_count <= 5:
+        pattern = "listicle_medium"
+    else:
+        pattern = "deep_dive"
+
+    return {"blocks": blocks, "pattern": pattern, "body_segments": body_count}
+
+
+def _extract_theses(sentences: list[str], max_theses: int = 5) -> list[dict]:
+    """Extract key talking points from sentences.
+
+    Heuristic: longer sentences with content words are more likely to be theses.
+    Skip very short sentences and filler phrases.
+    """
+    import re as _re
+
+    FILLER_PATTERNS = [
+        r"^(ну|так|вот|ладно|окей|хорошо|да\b|нет\b|ага|угу)",
+        r"^(well|so|okay|right|yeah|um|uh)\b",
+    ]
+
+    scored = []
+    for i, sent in enumerate(sentences):
+        words = sent.split()
+        if len(words) < 4:
+            continue
+        # Skip fillers
+        is_filler = any(_re.match(p, sent.lower()) for p in FILLER_PATTERNS)
+        if is_filler:
+            continue
+
+        # Score: word count + unique words ratio
+        unique_ratio = len(set(w.lower() for w in words)) / len(words)
+        score = len(words) * unique_ratio
+        scored.append({"index": i, "text": sent, "score": round(score, 2)})
+
+    # Top N by score
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:max_theses]
+    # Re-sort by original order
+    top.sort(key=lambda x: x["index"])
+
+    return [{"text": t["text"], "position": t["index"]} for t in top]
+
+
+_CTA_KEYWORDS_RU = [
+    "подписывайтесь", "подпишись", "подписка", "лайк", "ставьте лайк",
+    "комментарий", "напишите", "поделитесь", "репост", "ссылка в описании",
+    "сохраняйте", "отправьте другу", "нажмите", "кнопк", "колокольчик",
+]
+_CTA_KEYWORDS_EN = [
+    "subscribe", "like", "comment", "share", "follow",
+    "link in bio", "link in description", "hit the bell",
+    "let me know", "drop a comment", "save this", "send to a friend",
+]
+
+
+def _detect_cta(segments: list, sentences: list[str], total_duration: float) -> dict:
+    """Detect call-to-action in the transcript."""
+    all_cta_kw = _CTA_KEYWORDS_RU + _CTA_KEYWORDS_EN
+    cta_phrases = []
+
+    # Check last 15% of video (or last 10 seconds)
+    cta_zone_start = max(total_duration * 0.85, total_duration - 10) if total_duration > 0 else 0
+
+    for seg in segments:
+        text_lower = seg.get("text", "").lower()
+        for kw in all_cta_kw:
+            if kw in text_lower:
+                cta_phrases.append({
+                    "text": seg.get("text", "").strip(),
+                    "keyword": kw,
+                    "start_sec": seg.get("start"),
+                    "in_outro": seg.get("start", 0) >= cta_zone_start,
+                })
+                break
+
+    # Also check sentences (for non-segment mode)
+    if not cta_phrases and sentences:
+        for sent in sentences[-3:]:
+            text_lower = sent.lower()
+            for kw in all_cta_kw:
+                if kw in text_lower:
+                    cta_phrases.append({
+                        "text": sent,
+                        "keyword": kw,
+                        "in_outro": True,
+                    })
+                    break
+
+    return {
+        "detected": len(cta_phrases) > 0,
+        "phrases": cta_phrases,
+        "in_outro": any(p.get("in_outro") for p in cta_phrases),
+    }
+
+
+def _analyze_retention(segments: list, total_duration: float) -> dict:
+    """Analyze content density over time to identify retention patterns.
+
+    Divides video into zones and measures words-per-second as proxy for
+    content density. High density = more talking = likely higher retention.
+    """
+    if not segments or total_duration <= 0:
+        return {"zones": [], "avg_wps": 0, "peak_zone": None}
+
+    # Divide into 5 equal zones
+    n_zones = min(5, max(2, int(total_duration / 10)))
+    zone_dur = total_duration / n_zones
+    zones = []
+
+    peak_wps = 0
+    peak_idx = 0
+
+    for i in range(n_zones):
+        z_start = i * zone_dur
+        z_end = (i + 1) * zone_dur
+        zone_segs = [
+            s for s in segments
+            if s.get("start", 0) >= z_start - 0.5 and s.get("start", 0) < z_end
+        ]
+        word_count = sum(len(s.get("text", "").split()) for s in zone_segs)
+        wps = round(word_count / zone_dur, 2) if zone_dur > 0 else 0
+
+        label = "intro" if i == 0 else ("outro" if i == n_zones - 1 else f"mid_{i}")
+
+        zones.append({
+            "index": i,
+            "label": label,
+            "start_sec": round(z_start, 1),
+            "end_sec": round(z_end, 1),
+            "word_count": word_count,
+            "words_per_sec": wps,
+        })
+
+        if wps > peak_wps:
+            peak_wps = wps
+            peak_idx = i
+
+    total_words = sum(z["word_count"] for z in zones)
+    avg_wps = round(total_words / total_duration, 2) if total_duration > 0 else 0
+
+    return {
+        "zones": zones,
+        "avg_wps": avg_wps,
+        "peak_zone": zones[peak_idx]["label"] if zones else None,
+        "total_words": total_words,
+    }
+
+
 # ============== Generation Pipeline Tools (G-series) ==============
 
 @PipelineExecutor.register("G01_SCRIPT")
@@ -1568,12 +1922,24 @@ async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
 
     Reads candidate_meta (hook, script, keywords) or brief_data (topic, style)
     and produces a structured script JSON saved to task folder.
+
+    If script_analysis is available (from A01_SCRIPT_ANALYSIS), uses the
+    original video's hook, structure, theses and CTA as a blueprint to
+    generate a NEW version — same ideas, different words.
     """
     meta = ctx.candidate_meta or {}
     brief = ctx.brief_data or {}
 
-    # Gather inputs
-    hook = meta.get("hook") or params.get("hook", "")
+    # ── Script analysis from A01 (if available) ──────────────
+    analysis = (
+        ctx.outputs.get("script_analysis")
+        or meta.get("script_analysis")
+        or {}
+    )
+    has_analysis = bool(analysis and analysis.get("hook"))
+
+    # Gather inputs — analysis overrides generic defaults
+    hook = analysis.get("hook") or meta.get("hook") or params.get("hook", "")
     existing_script = meta.get("script") or params.get("script", "")
     topic = brief.get("topic") or meta.get("topic") or params.get("topic", "Untitled")
     style = brief.get("style") or params.get("style", "educational")
@@ -1587,47 +1953,133 @@ async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
     keywords = meta.get("keywords") or params.get("keywords", [])
     language = brief.get("language") or params.get("language", "ru")
 
-    # Build structured script
-    segments = []
     dur = int(target_duration)
+    segments = []
 
-    # Intro segment
-    segments.append({
-        "index": 0,
-        "type": "hook",
-        "start_sec": 0,
-        "end_sec": min(3, dur),
-        "text": hook or f"Привет! Сегодня поговорим о {topic}",
-        "notes": "attention-grabbing opening",
-    })
+    if has_analysis:
+        # ── Build script FROM analysis blueprint ─────────────
+        ctx.log("[G01_SCRIPT] Using A01 script_analysis as blueprint")
 
-    # Main body segments (split evenly)
-    body_start = min(3, dur)
-    body_end = max(body_start + 1, dur - 5)
-    body_duration = body_end - body_start
-    n_body = max(1, body_duration // 15)  # ~15 sec per segment
+        src_blocks = analysis.get("structure", {}).get("blocks", [])
+        src_theses = analysis.get("theses", [])
+        src_cta = analysis.get("cta", {})
 
-    for i in range(n_body):
-        seg_start = body_start + i * (body_duration // n_body)
-        seg_end = body_start + (i + 1) * (body_duration // n_body)
+        # Scale source timing to target duration
+        src_dur = analysis.get("total_duration_sec") or dur
+        time_scale = dur / src_dur if src_dur > 0 else 1.0
+
+        seg_idx = 0
+
+        # Hook from analysis
         segments.append({
-            "index": i + 1,
-            "type": "body",
-            "start_sec": seg_start,
-            "end_sec": seg_end,
-            "text": f"[Основная часть {i + 1}/{n_body}] — раскрытие темы «{topic}»",
-            "notes": f"segment {i+1}, style: {style}, tone: {tone}",
+            "index": seg_idx,
+            "type": "hook",
+            "start_sec": 0,
+            "end_sec": min(3, dur),
+            "text": f"[ПЕРЕПИСАТЬ] {hook}",
+            "source_text": hook,
+            "notes": "rewrite the hook — same idea, new words",
+        })
+        seg_idx += 1
+
+        # Body segments from structure blocks
+        thesis_iter = iter(src_theses)
+        for block in src_blocks:
+            if block.get("type") not in ("body",):
+                continue
+            scaled_start = round(block.get("start_sec", 0) * time_scale, 1)
+            scaled_end = round(block.get("end_sec", 0) * time_scale, 1)
+            # Clamp to target duration
+            scaled_start = min(scaled_start, dur - 1)
+            scaled_end = min(scaled_end, dur)
+
+            # Attach thesis if available
+            thesis = next(thesis_iter, None)
+            thesis_text = thesis["text"] if thesis else block.get("text", "")
+
+            segments.append({
+                "index": seg_idx,
+                "type": "body",
+                "start_sec": scaled_start,
+                "end_sec": scaled_end,
+                "text": f"[ПЕРЕПИСАТЬ] {thesis_text}",
+                "source_text": thesis_text,
+                "notes": f"rewrite body segment — same thesis, new delivery. style: {style}, tone: {tone}",
+            })
+            seg_idx += 1
+
+        # If no body blocks from analysis, create from theses
+        if not any(s["type"] == "body" for s in segments):
+            body_start = min(3, dur)
+            body_end = max(body_start + 1, dur - 5)
+            for i, thesis in enumerate(src_theses):
+                n = len(src_theses) or 1
+                seg_start = body_start + i * ((body_end - body_start) // n)
+                seg_end = body_start + (i + 1) * ((body_end - body_start) // n)
+                segments.append({
+                    "index": seg_idx,
+                    "type": "body",
+                    "start_sec": seg_start,
+                    "end_sec": seg_end,
+                    "text": f"[ПЕРЕПИСАТЬ] {thesis['text']}",
+                    "source_text": thesis["text"],
+                    "notes": f"rewrite thesis {i+1}/{len(src_theses)}, style: {style}",
+                })
+                seg_idx += 1
+
+        # CTA from analysis
+        cta_text = ""
+        if src_cta.get("detected") and src_cta.get("phrases"):
+            cta_text = src_cta["phrases"][0].get("text", "")
+        cta_fallback = cta_text or "Подписывайтесь и ставьте лайк!"
+
+        body_end_sec = segments[-1]["end_sec"] if segments else dur - 5
+        segments.append({
+            "index": seg_idx,
+            "type": "cta",
+            "start_sec": body_end_sec,
+            "end_sec": dur,
+            "text": f"[ПЕРЕПИСАТЬ] {cta_fallback}",
+            "source_text": cta_fallback,
+            "notes": "rewrite CTA — same intent, fresh phrasing",
         })
 
-    # CTA / outro
-    segments.append({
-        "index": len(segments),
-        "type": "cta",
-        "start_sec": body_end,
-        "end_sec": dur,
-        "text": "Подписывайтесь и ставьте лайк! До встречи в следующем видео.",
-        "notes": "call to action + closing",
-    })
+    else:
+        # ── Original template-based generation ───────────────
+        segments.append({
+            "index": 0,
+            "type": "hook",
+            "start_sec": 0,
+            "end_sec": min(3, dur),
+            "text": hook or f"Привет! Сегодня поговорим о {topic}",
+            "notes": "attention-grabbing opening",
+        })
+
+        body_start = min(3, dur)
+        body_end = max(body_start + 1, dur - 5)
+        body_duration = body_end - body_start
+        n_body = max(1, body_duration // 15)
+
+        for i in range(n_body):
+            seg_start = body_start + i * (body_duration // n_body)
+            seg_end = body_start + (i + 1) * (body_duration // n_body)
+            segments.append({
+                "index": i + 1,
+                "type": "body",
+                "start_sec": seg_start,
+                "end_sec": seg_end,
+                "text": f"[Основная часть {i + 1}/{n_body}] — раскрытие темы «{topic}»",
+                "notes": f"segment {i+1}, style: {style}, tone: {tone}",
+            })
+
+        segments.append({
+            "index": len(segments),
+            "type": "cta",
+            "start_sec": body_end,
+            "end_sec": dur,
+            "text": "Подписывайтесь и ставьте лайк! До встречи в следующем видео.",
+            "notes": "call to action + closing",
+        })
 
     script_data = {
         "topic": topic,
@@ -1639,6 +2091,8 @@ async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
         "keywords": keywords,
         "segments": segments,
         "full_text": existing_script or "\n".join(s["text"] for s in segments),
+        "based_on_analysis": has_analysis,
+        "retention_pattern": analysis.get("retention_pattern") if has_analysis else None,
     }
 
     # Save to task folder
@@ -1655,7 +2109,8 @@ async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
     ctx.outputs["script_path"] = str(script_path)
     ctx.caption_text = script_data["full_text"]
 
-    ctx.log(f"[G01_SCRIPT] Generated script: {len(segments)} segments, {dur}s, {len(keywords)} keywords")
+    mode = "from_analysis" if has_analysis else "template"
+    ctx.log(f"[G01_SCRIPT] Generated script ({mode}): {len(segments)} segments, {dur}s, {len(keywords)} keywords")
 
     return {
         "path": str(script_path),
@@ -1664,6 +2119,7 @@ async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
         "duration_sec": dur,
         "topic": topic,
         "style": style,
+        "based_on_analysis": has_analysis,
     }
 
 
