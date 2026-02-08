@@ -29,6 +29,7 @@ from app.models import (
     YouTubeVideo,
 )
 from app.schemas import (
+    CandidateApproveRequest,
     CandidateApproveResponse,
     CandidateCreate,
     CandidateRateRequest,
@@ -138,9 +139,17 @@ async def create_candidate(
 async def approve_candidate(
     project_id: int,
     candidate_id: int,
+    body: CandidateApproveRequest | None = None,
     session: AsyncSession = SessionDep,
 ):
-    """Approve candidate → create PublishTask and link it."""
+    """Approve candidate → create PublishTask and link it.
+
+    Если в body передан destination_id — используется указанный destination.
+    Иначе — первый активный destination проекта.
+    """
+    if body is None:
+        body = CandidateApproveRequest()
+
     candidate = await session.get(Candidate, candidate_id)
     if not candidate or candidate.project_id != project_id:
         raise HTTPException(status_code=404, detail="Candidate not found in this project")
@@ -161,10 +170,24 @@ async def approve_candidate(
     if not project.destinations:
         raise HTTPException(status_code=400, detail="Project has no destinations configured")
 
-    # Pick first active destination
-    dest = next((d for d in project.destinations if d.is_active), None)
-    if not dest:
-        raise HTTPException(status_code=400, detail="No active destination found")
+    # Resolve destination
+    dest = None
+    if body.destination_id:
+        dest = next((d for d in project.destinations if d.id == body.destination_id), None)
+        if not dest:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Destination #{body.destination_id} not found in this project",
+            )
+        if not dest.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Destination #{body.destination_id} is not active",
+            )
+    else:
+        dest = next((d for d in project.destinations if d.is_active), None)
+        if not dest:
+            raise HTTPException(status_code=400, detail="No active destination found")
 
     # For GENERATE candidates, load brief data into task metadata
     is_generate = candidate.origin == CandidateOrigin.generate.value
@@ -218,6 +241,8 @@ async def approve_candidate(
         candidate_id=candidate.id,
         task_id=task.id,
         status=candidate.status,
+        destination_platform=dest.platform,
+        destination_account_id=dest.social_account_id,
     )
 
 

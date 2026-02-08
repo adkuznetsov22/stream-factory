@@ -29,6 +29,14 @@ type Candidate = {
   linked_publish_task_id: number | null;
 };
 
+type Destination = {
+  id: number;
+  platform: string;
+  social_account_id: number;
+  is_active: boolean;
+  priority: number;
+};
+
 type Toast = { message: string; type: "success" | "error" } | null;
 
 const PLATFORM_COLORS: Record<string, string> = {
@@ -86,6 +94,11 @@ export default function ProjectFeedPage() {
   const [syncing, setSyncing] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [actionLoading, setActionLoading] = useState<number | null>(null);
+  const [destinations, setDestinations] = useState<Destination[]>([]);
+
+  // Approve modal
+  const [approveTarget, setApproveTarget] = useState<Candidate | null>(null);
+  const [selectedDestId, setSelectedDestId] = useState<number | null>(null);
 
   // Filters
   const [platform, setPlatform] = useState("");
@@ -128,6 +141,15 @@ export default function ProjectFeedPage() {
 
   useEffect(() => { loadFeed(); }, [loadFeed]);
 
+  // Загрузка destinations проекта
+  useEffect(() => {
+    if (!projectId) return;
+    fetch(`/api/projects/${projectId}/destinations`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setDestinations)
+      .catch(() => {});
+  }, [projectId]);
+
   const syncSources = async () => {
     setSyncing(true);
     try {
@@ -147,13 +169,30 @@ export default function ProjectFeedPage() {
     }
   };
 
-  const approve = async (c: Candidate) => {
+  const openApproveModal = (c: Candidate) => {
+    const activeDests = destinations.filter(d => d.is_active);
+    if (activeDests.length <= 1) {
+      // Один или ноль — сразу approve без модалки
+      doApprove(c, activeDests[0]?.id ?? null);
+    } else {
+      setApproveTarget(c);
+      setSelectedDestId(activeDests[0]?.id ?? null);
+    }
+  };
+
+  const doApprove = async (c: Candidate, destId: number | null) => {
+    setApproveTarget(null);
     setActionLoading(c.id);
     try {
-      const res = await fetch(`/api/projects/${projectId}/feed/${c.id}/approve`, { method: "POST" });
+      const res = await fetch(`/api/projects/${projectId}/feed/${c.id}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ destination_id: destId }),
+      });
       if (res.ok) {
         const data = await res.json();
-        showToast(`Одобрено → задача #${data.task_id}`);
+        const platInfo = data.destination_platform ? ` → ${data.destination_platform}` : "";
+        showToast(`Одобрено${platInfo} → задача #${data.task_id}`);
         loadFeed();
         setTimeout(() => router.push(`/queue/${data.task_id}`), 800);
       } else {
@@ -437,7 +476,7 @@ export default function ProjectFeedPage() {
                     {c.status === "NEW" && (
                       <>
                         <button
-                          onClick={() => approve(c)}
+                          onClick={() => openApproveModal(c)}
                           disabled={isLoading}
                           style={{
                             flex: 1, padding: "8px 0", borderRadius: 6, fontSize: 12, fontWeight: 600,
@@ -471,7 +510,7 @@ export default function ProjectFeedPage() {
                     )}
                     {c.status === "REJECTED" && (
                       <button
-                        onClick={() => approve(c)}
+                        onClick={() => openApproveModal(c)}
                         disabled={isLoading}
                         style={{
                           flex: 1, padding: "8px 0", borderRadius: 6, fontSize: 12, fontWeight: 500,
@@ -511,6 +550,79 @@ export default function ProjectFeedPage() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Approve Destination Modal */}
+      {approveTarget && (
+        <div
+          onClick={() => setApproveTarget(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
+        >
+          <div onClick={e => e.stopPropagation()} style={{
+            background: "var(--bg-subtle)", borderRadius: "var(--radius-lg)",
+            border: "1px solid var(--border)", width: "100%", maxWidth: 420, padding: 24,
+          }}>
+            <div style={{ fontWeight: 600, fontSize: 16, marginBottom: 4 }}>
+              Выберите назначение
+            </div>
+            <div style={{ fontSize: 13, color: "var(--fg-subtle)", marginBottom: 16 }}>
+              {approveTarget.title || approveTarget.platform_video_id}
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+              {destinations.filter(d => d.is_active).map(d => (
+                <label
+                  key={d.id}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, padding: "10px 14px",
+                    background: selectedDestId === d.id ? "#3b82f615" : "var(--bg-muted)",
+                    border: selectedDestId === d.id ? "1px solid #3b82f6" : "1px solid var(--border)",
+                    borderRadius: 8, cursor: "pointer", transition: "all 0.15s",
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="dest"
+                    checked={selectedDestId === d.id}
+                    onChange={() => setSelectedDestId(d.id)}
+                  />
+                  <span style={{
+                    padding: "2px 8px", borderRadius: 4, fontSize: 11, fontWeight: 600,
+                    background: PLATFORM_COLORS[d.platform] || "#666", color: "#fff",
+                  }}>
+                    {PLATFORM_ICONS[d.platform] || "•"} {d.platform}
+                  </span>
+                  <span style={{ fontSize: 13 }}>Аккаунт #{d.social_account_id}</span>
+                  {d.priority > 0 && (
+                    <span style={{ fontSize: 11, color: "var(--fg-subtle)", marginLeft: "auto" }}>
+                      приоритет {d.priority}
+                    </span>
+                  )}
+                </label>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setApproveTarget(null)}
+                style={{ padding: "10px 20px", background: "var(--bg-muted)", borderRadius: 6, color: "var(--fg-muted)", fontSize: 13 }}
+              >
+                Отмена
+              </button>
+              <button
+                onClick={() => approveTarget && doApprove(approveTarget, selectedDestId)}
+                disabled={!selectedDestId}
+                style={{
+                  padding: "10px 20px", background: "#22c55e", borderRadius: 6,
+                  color: "#fff", fontWeight: 600, fontSize: 13,
+                  opacity: selectedDestId ? 1 : 0.5,
+                }}
+              >
+                ✓ Approve
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

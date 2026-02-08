@@ -505,10 +505,16 @@ class CandidateRateRequest(BaseModel):
     notes: str | None = None
 
 
+class CandidateApproveRequest(BaseModel):
+    destination_id: int | None = None
+
+
 class CandidateApproveResponse(BaseModel):
     candidate_id: int
     task_id: int
     status: str
+    destination_platform: str | None = None
+    destination_account_id: int | None = None
 
 
 # ── Briefs ─────────────────────────────────────────────────────
