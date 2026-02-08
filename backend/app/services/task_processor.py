@@ -96,6 +96,12 @@ class TaskProcessor:
         if project and project.policy and isinstance(project.policy, dict):
             ctx.policy = project.policy
         
+        # Populate publishing context for P01_PUBLISH
+        ctx.session = self.session
+        ctx.publish_task = task
+        ctx.platform = task.platform
+        ctx.destination_account_id = task.destination_social_account_id
+        
         # Populate export profile for encoding steps
         if project and project.export_profile_id:
             ep = await self.session.get(ExportProfile, project.export_profile_id)

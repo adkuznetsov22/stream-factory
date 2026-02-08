@@ -62,6 +62,12 @@ class StepContext:
         # Export profile (platform-specific encoding params)
         self.export_profile: dict = {}
         
+        # Publishing context (for P01_PUBLISH)
+        self.session: Any = None          # AsyncSession — set by task_processor
+        self.publish_task: Any = None     # PublishTask ORM object
+        self.platform: str | None = None
+        self.destination_account_id: int | None = None
+        
         # Step outputs accumulator
         self.outputs: dict[str, Any] = {}
     
@@ -1855,3 +1861,118 @@ async def handle_generate_tts(ctx: StepContext, params: dict) -> dict:
         "size": size,
         "text_length": len(text),
     }
+
+
+# ============== Publishing ==============
+
+@PipelineExecutor.register("P01_PUBLISH")
+async def handle_publish(ctx: StepContext, params: dict) -> dict:
+    """Publish the final video to the destination platform.
+
+    Выполняется как последний шаг пресета (после T18_QC).
+    Использует PublisherAdapter для загрузки на платформу.
+
+    Обновляет:
+    - PublishTask.status: done → publishing → published / error
+    - PublishTask.published_url, published_external_id, published_at
+    - Candidate.status → USED (если связан)
+    """
+    from app.models import PublishTask, SocialAccount, Candidate, CandidateStatus
+    from app.services.publisher_adapter import get_publisher, PublishResult
+
+    session = ctx.session
+    task = ctx.publish_task
+
+    if not session or not task:
+        raise RuntimeError("P01_PUBLISH requires session and publish_task in StepContext")
+
+    # Resolve output video
+    input_path = ctx.get_input_video()
+    if not input_path or not input_path.exists():
+        # Fallback: try known paths
+        for name in ("final.mp4", "ready.mp4", "output.mp4"):
+            p = ctx.task_dir / name
+            if p.exists():
+                input_path = p
+                break
+
+    if not input_path or not input_path.exists():
+        raise RuntimeError(f"P01_PUBLISH: no output video found in {ctx.task_dir}")
+
+    # Get destination account
+    account = await session.get(SocialAccount, ctx.destination_account_id)
+    if not account:
+        raise RuntimeError(f"P01_PUBLISH: destination account #{ctx.destination_account_id} not found")
+
+    platform = (ctx.platform or task.platform or "").lower()
+    adapter = get_publisher(platform)
+    if not adapter:
+        raise RuntimeError(f"P01_PUBLISH: no adapter for platform '{platform}'")
+
+    # Mark as publishing
+    task.status = "publishing"
+    session.add(task)
+    await session.commit()
+    ctx.log(f"[P01_PUBLISH] Publishing to {platform} via {adapter.__class__.__name__}")
+
+    # Prepare metadata
+    title = task.caption_text or task.instructions or f"Video #{task.id}"
+    description = task.caption_text or ""
+    tags: list[str] = []
+    if task.artifacts and isinstance(task.artifacts, dict):
+        t = task.artifacts.get("tags") or task.artifacts.get("hashtags") or []
+        if isinstance(t, list):
+            tags = [str(x) for x in t]
+
+    # Publish
+    result: PublishResult = await adapter.publish(
+        task=task,
+        account=account,
+        file_path=input_path,
+        title=title,
+        description=description,
+        tags=tags,
+    )
+
+    now = datetime.now(timezone.utc)
+
+    if result.success:
+        task.status = "published"
+        task.published_url = result.url
+        task.published_external_id = result.external_id
+        task.published_at = now
+        task.publish_error = None
+        session.add(task)
+
+        # Update linked Candidate → USED
+        from sqlalchemy import select as sa_select
+        cand_q = await session.execute(
+            sa_select(Candidate).where(Candidate.linked_publish_task_id == task.id)
+        )
+        candidate = cand_q.scalar_one_or_none()
+        if candidate:
+            candidate.status = CandidateStatus.used.value
+            session.add(candidate)
+            ctx.log(f"[P01_PUBLISH] Candidate #{candidate.id} → USED")
+
+        await session.commit()
+
+        ctx.log(
+            f"[P01_PUBLISH] Published: url={result.url}, "
+            f"external_id={result.external_id}, platform={result.platform}"
+        )
+
+        return {
+            "published": True,
+            "published_url": result.url,
+            "published_external_id": result.external_id,
+            "platform": result.platform,
+        }
+    else:
+        task.status = "error"
+        task.publish_error = result.error
+        task.error_message = f"P01_PUBLISH failed: {result.error}"
+        session.add(task)
+        await session.commit()
+
+        raise RuntimeError(f"P01_PUBLISH failed: {result.error}")
