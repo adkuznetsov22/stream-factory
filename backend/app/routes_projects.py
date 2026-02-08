@@ -1633,12 +1633,20 @@ async def get_task_metrics(task_id: int, session: AsyncSession = SessionDep):
 
 
 @router.get("/projects/{project_id}/analytics/score-vs-performance", response_model=list[dict])
-async def score_vs_performance(project_id: int, session: AsyncSession = SessionDep):
+async def score_vs_performance(
+    project_id: int,
+    platform: str | None = None,
+    age_bucket: str | None = None,
+    session: AsyncSession = SessionDep,
+):
     """Candidate virality_score → actual published video performance.
 
-    Returns list of {candidate_id, virality_score, virality_factors,
-    views, likes, comments, shares, hours_since_publish} for all
-    published candidates in the project. Uses latest metric snapshot.
+    Includes age_bucket, performance_rate, and platform for proper
+    comparison across different video ages and platforms.
+
+    Query params:
+      - platform: filter by platform (youtube, tiktok, instagram, vk)
+      - age_bucket: filter by age bucket (0-6h, 6-24h, 1-3d, 3-7d, 7d+)
     """
     from app.models import Candidate, PublishedVideoMetrics, PublishTask
     from sqlalchemy import func, and_
@@ -1667,6 +1675,7 @@ async def score_vs_performance(project_id: int, session: AsyncSession = SessionD
             PublishedVideoMetrics.hours_since_publish,
             PublishedVideoMetrics.snapshot_at,
             PublishTask.published_url,
+            PublishTask.published_at,
         )
         .join(PublishTask, Candidate.linked_publish_task_id == PublishTask.id)
         .join(PublishedVideoMetrics, PublishedVideoMetrics.task_id == PublishTask.id)
@@ -1685,26 +1694,64 @@ async def score_vs_performance(project_id: int, session: AsyncSession = SessionD
         .order_by(Candidate.virality_score.desc())
     )
 
+    if platform:
+        query = query.where(Candidate.platform == platform.lower())
+
     result = await session.execute(query)
     rows = result.all()
 
-    return [
-        {
+    items = []
+    for row in rows:
+        h = row.hours_since_publish or 0
+        bucket = _age_bucket(h)
+
+        # Skip if age_bucket filter is set and doesn't match
+        if age_bucket and bucket != age_bucket:
+            continue
+
+        views = row.views or 0
+        likes = row.likes or 0
+        comments = row.comments or 0
+
+        views_per_hour = round(views / max(h, 1), 1)
+        like_rate = round(likes / max(views, 1), 4)
+        comment_rate = round(comments / max(views, 1), 4)
+
+        items.append({
             "candidate_id": row.candidate_id,
             "virality_score": row.virality_score,
             "virality_factors": row.virality_factors,
             "title": row.title,
             "platform": row.platform,
-            "views": row.views,
-            "likes": row.likes,
-            "comments": row.comments,
+            "views": views,
+            "likes": likes,
+            "comments": comments,
             "shares": row.shares,
-            "hours_since_publish": row.hours_since_publish,
+            "hours_since_publish": h,
+            "age_bucket": bucket,
+            "performance_rate": {
+                "views_per_hour": views_per_hour,
+                "like_rate": like_rate,
+                "comment_rate": comment_rate,
+            },
             "snapshot_at": row.snapshot_at.isoformat() if row.snapshot_at else None,
             "published_url": row.published_url,
-        }
-        for row in rows
-    ]
+        })
+
+    return items
+
+
+def _age_bucket(hours: int) -> str:
+    """Classify hours_since_publish into comparable age buckets."""
+    if hours <= 6:
+        return "0-6h"
+    if hours <= 24:
+        return "6-24h"
+    if hours <= 72:
+        return "1-3d"
+    if hours <= 168:
+        return "3-7d"
+    return "7d+"
 
 
 @router.get("/export-profiles", response_model=list[ExportProfileRead])
