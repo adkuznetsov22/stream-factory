@@ -439,6 +439,7 @@ class ExportProfile(Base):
     audio_bitrate: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="192k")
     audio_sample_rate: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="44100")
     safe_area: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    safe_area_mode: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default="platform_default")
     extra: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
     is_builtin: Mapped[bool] = mapped_column(sa.Boolean(), nullable=False, server_default=sa.false())
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)

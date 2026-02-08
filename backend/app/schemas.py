@@ -123,6 +123,7 @@ class ExportProfileRead(BaseModel):
     audio_bitrate: str
     audio_sample_rate: int
     safe_area: dict | None = None
+    safe_area_mode: str = "platform_default"
     extra: dict | None = None
     is_builtin: bool
 

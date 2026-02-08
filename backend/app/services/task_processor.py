@@ -119,6 +119,7 @@ class TaskProcessor:
                     "audio_bitrate": ep.audio_bitrate,
                     "audio_sample_rate": ep.audio_sample_rate,
                     "safe_area": ep.safe_area or {},
+                    "safe_area_mode": ep.safe_area_mode,
                     "extra": ep.extra or {},
                 }
                 log_cb(f"Export profile: {ep.name} ({ep.target_platform})")
