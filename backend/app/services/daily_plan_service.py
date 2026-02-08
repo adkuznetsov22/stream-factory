@@ -27,7 +27,7 @@ DEFAULT_PUBLISH_SETTINGS: dict[str, Any] = {
     "daily_limit_per_destination": 3,
 }
 
-ELIGIBLE_STATUSES = {"done", "ready_for_review"}
+ELIGIBLE_STATUSES = {"ready_for_publish"}
 
 
 def _get_publish_settings(project: Project) -> dict[str, Any]:

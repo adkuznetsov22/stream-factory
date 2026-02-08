@@ -143,7 +143,7 @@ async def bulk_enqueue(body: BulkIdsBody, session: AsyncSession = SessionDep):
         if not task:
             failed.append({"id": tid, "reason": "not_found"})
             continue
-        if task.status not in ("queued", "error", "ready_for_review", "done"):
+        if task.status not in ("queued", "error", "ready_for_review", "done", "ready_for_publish"):
             failed.append({"id": tid, "reason": f"invalid_status:{task.status}"})
             continue
 
@@ -170,7 +170,7 @@ async def bulk_enqueue(body: BulkIdsBody, session: AsyncSession = SessionDep):
 # ── Bulk pause ───────────────────────────────────────────────
 @router.post("/tasks/bulk-pause")
 async def bulk_pause(body: BulkIdsBody, session: AsyncSession = SessionDep):
-    allowed = {"queued", "processing", "ready_for_review", "done"}
+    allowed = {"queued", "processing", "ready_for_review", "done", "ready_for_publish"}
     now = datetime.now(timezone.utc)
     ok, failed = [], []
 
@@ -185,7 +185,7 @@ async def bulk_pause(body: BulkIdsBody, session: AsyncSession = SessionDep):
 
         _revoke_if_queued(task, now, session, "pause")
 
-        if task.status in ("queued", "ready_for_review", "done"):
+        if task.status in ("queued", "ready_for_review", "done", "ready_for_publish"):
             task.status = "paused"
             task.paused_at = now
         task.pause_requested_at = now
@@ -250,7 +250,7 @@ async def bulk_cancel(body: BulkIdsBody, session: AsyncSession = SessionDep):
 
         task.cancel_requested_at = now
         task.cancel_reason = body.reason
-        if task.status in ("queued", "paused", "ready_for_review", "done", "error"):
+        if task.status in ("queued", "paused", "ready_for_review", "done", "ready_for_publish", "error"):
             task.status = "canceled"
             task.canceled_at = now
         session.add(task)

@@ -36,8 +36,8 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
-# Task statuses eligible for auto-publish (pipeline done, not yet published)
-PUBLISH_ELIGIBLE_STATUSES = {"done", "ready_for_review"}
+# Task statuses eligible for auto-publish (must be explicitly marked ready)
+PUBLISH_ELIGIBLE_STATUSES = {"ready_for_publish"}
 
 DAY_ABBREV = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 

@@ -72,6 +72,7 @@ TASK_STATUS_LABELS = {
     "processing": "В обработке",
     "ready_for_review": "На проверке",
     "done": "Готово",
+    "ready_for_publish": "К публикации",
     "completed": "Готово",
     "error": "Ошибка",
 }
@@ -1635,7 +1636,7 @@ async def enqueue_task(task_id: int, session: AsyncSession = SessionDep):
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    if task.status not in ("queued", "error", "ready_for_review", "done"):
+    if task.status not in ("queued", "error", "ready_for_review", "done", "ready_for_publish"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot enqueue task with status '{task.status}'",
@@ -1682,7 +1683,7 @@ async def pause_task(task_id: int, session: AsyncSession = SessionDep, reason: s
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    allowed = {"queued", "processing", "ready_for_review", "done"}
+    allowed = {"queued", "processing", "ready_for_review", "done", "ready_for_publish"}
     if task.status not in allowed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1709,7 +1710,7 @@ async def pause_task(task_id: int, session: AsyncSession = SessionDep, reason: s
             logger.warning(f"[pause] Failed to revoke celery task {task.celery_task_id}: {e}")
 
     # If not actively processing, pause immediately
-    if task.status in ("queued", "ready_for_review", "done"):
+    if task.status in ("queued", "ready_for_review", "done", "ready_for_publish"):
         task.status = "paused"
         task.paused_at = now
     task.pause_requested_at = now
@@ -1792,7 +1793,7 @@ async def cancel_task(task_id: int, session: AsyncSession = SessionDep, reason: 
             logger.warning(f"[cancel] Failed to revoke celery task {task.celery_task_id}: {e}")
 
     # If not actively processing, cancel immediately
-    if task.status in ("queued", "paused", "ready_for_review", "done", "error"):
+    if task.status in ("queued", "paused", "ready_for_review", "done", "ready_for_publish", "error"):
         task.status = "canceled"
         task.canceled_at = now
 
@@ -1801,6 +1802,84 @@ async def cancel_task(task_id: int, session: AsyncSession = SessionDep, reason: 
     await session.refresh(task)
 
     return {"ok": True, "task_id": task_id, "status": task.status, "revoked": revoked, "cancel_requested_at": task.cancel_requested_at.isoformat() if task.cancel_requested_at else None}
+
+
+# ── Mark Ready for Publish ────────────────────────────────────
+
+@router.post("/publish-tasks/{task_id}/mark-ready-for-publish", response_model=dict)
+async def mark_ready_for_publish(task_id: int, session: AsyncSession = SessionDep):
+    """Validate task readiness and set status to ready_for_publish."""
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    checks: list[dict] = []
+    has_errors = False
+
+    # 1. Статус — не canceled, не paused, не published
+    blocked_statuses = {"canceled", "paused", "published", "ready_for_publish"}
+    if task.status in blocked_statuses:
+        checks.append({"check": "status", "ok": False, "detail": f"Недопустимый статус: {task.status}"})
+        has_errors = True
+    else:
+        checks.append({"check": "status", "ok": True, "detail": task.status})
+
+    # 2. Итоговый видеофайл
+    artifacts = task.artifacts or {}
+    video_path = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
+    if video_path:
+        checks.append({"check": "video_file", "ok": True, "detail": video_path.split("/")[-1] if isinstance(video_path, str) else "yes"})
+    else:
+        checks.append({"check": "video_file", "ok": False, "detail": "Нет итогового видео (final.mp4 / ready.mp4)"})
+        has_errors = True
+
+    # 3. Нет publish_error
+    if task.publish_error:
+        checks.append({"check": "publish_error", "ok": False, "detail": task.publish_error[:120]})
+        has_errors = True
+    else:
+        checks.append({"check": "publish_error", "ok": True, "detail": "clean"})
+
+    # 4. QC step (T18_QC) — проверяем в step_results
+    sr_q = await session.execute(
+        select(StepResult)
+        .where(StepResult.task_id == task_id, StepResult.tool_id == "T18_QC")
+        .order_by(StepResult.version.desc())
+        .limit(1)
+    )
+    qc_result = sr_q.scalar_one_or_none()
+    if qc_result and qc_result.status == "done":
+        checks.append({"check": "qc_pass", "ok": True, "detail": "T18_QC done"})
+    elif qc_result:
+        checks.append({"check": "qc_pass", "ok": False, "detail": f"T18_QC status={qc_result.status}"})
+        has_errors = True
+    else:
+        # QC шаг не найден — не блокируем (пресет может не включать QC)
+        checks.append({"check": "qc_pass", "ok": True, "detail": "T18_QC not in preset (skipped)"})
+
+    if has_errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "not_ready", "checks": checks},
+        )
+
+    # Всё ок — переводим в ready_for_publish
+    now = datetime.now(timezone.utc)
+    task.status = "ready_for_publish"
+    session.add(task)
+
+    session.add(StepResult(
+        task_id=task_id, step_index=9997, tool_id="CONTROL",
+        step_name="Mark ready for publish",
+        status="done",
+        output_data={"action": "mark_ready_for_publish", "checks": checks},
+        started_at=now, completed_at=now,
+    ))
+
+    await session.commit()
+    await session.refresh(task)
+
+    return {"ok": True, "task_id": task_id, "status": task.status, "checks": checks}
 
 
 # ── Daily Publish Plan ────────────────────────────────────────

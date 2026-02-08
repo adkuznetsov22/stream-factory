@@ -38,11 +38,11 @@ type BulkResult = { ok: number[]; failed: { id: number; reason: string }[] };
 
 const STATUS_COLORS: Record<string, string> = {
   queued: "#3b82f6", processing: "#f59e0b", ready_for_review: "#a855f7",
-  done: "#22c55e", publishing: "#8b5cf6", published: "#10b981",
+  done: "#22c55e", ready_for_publish: "#0ea5e9", publishing: "#8b5cf6", published: "#10b981",
   error: "#ef4444", canceled: "#6b7280", paused: "#eab308",
 };
 
-const STATUSES = ["", "queued", "processing", "ready_for_review", "done", "publishing", "published", "error", "canceled", "paused"];
+const STATUSES = ["", "queued", "processing", "ready_for_review", "done", "ready_for_publish", "publishing", "published", "error", "canceled", "paused"];
 
 const chip = (bg: string, fg: string, text: string) => (
   <span style={{ padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 600, background: bg, color: fg, whiteSpace: "nowrap" }}>{text}</span>

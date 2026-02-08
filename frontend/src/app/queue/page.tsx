@@ -17,11 +17,11 @@ type Task = {
 type Project = { id: number; name: string };
 
 const STATUS_LABELS: Record<string, string> = {
-  queued: "Очередь", processing: "Обработка", ready_for_review: "Проверка", done: "Готово", error: "Ошибка", published: "Опубликовано",
+  queued: "Очередь", processing: "Обработка", ready_for_review: "Проверка", done: "Готово", ready_for_publish: "К публикации", error: "Ошибка", published: "Опубликовано",
 };
 
 const STATUS_CLASS: Record<string, string> = {
-  queued: "", processing: "badge-info", ready_for_review: "badge-warning", done: "badge-success", error: "badge-error", published: "badge-info",
+  queued: "", processing: "badge-info", ready_for_review: "badge-warning", done: "badge-success", ready_for_publish: "badge-warning", error: "badge-error", published: "badge-info",
 };
 
 export default function QueuePage() {
@@ -64,7 +64,7 @@ export default function QueuePage() {
 
       <div className="filters">
         <div className="filter-tabs">
-          {["all", "queued", "processing", "ready_for_review", "done", "error"].map(s => (
+          {["all", "queued", "processing", "ready_for_review", "done", "ready_for_publish", "error"].map(s => (
             <button key={s} className={`filter-tab ${filter === s ? "active" : ""}`} onClick={() => setFilter(s)}>
               {s === "all" ? "Все" : STATUS_LABELS[s]}
             </button>

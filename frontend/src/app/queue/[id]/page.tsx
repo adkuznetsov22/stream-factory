@@ -398,6 +398,28 @@ export default function TaskDetailPage() {
     await fetchData();
   };
 
+  const [readyChecks, setReadyChecks] = useState<{check:string;ok:boolean;detail:string}[] | null>(null);
+
+  const handleMarkReadyForPublish = async () => {
+    if (!taskId) return;
+    setActionError(null);
+    setReadyChecks(null);
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/mark-ready-for-publish`, { method: "POST" });
+    if (res.ok) {
+      const j = await res.json();
+      setReadyChecks(j.checks || null);
+      await fetchData();
+    } else {
+      const err = await res.json().catch(() => ({ detail: "Ошибка" }));
+      if (err.detail?.checks) {
+        setReadyChecks(err.detail.checks);
+        setActionError("Задача не готова к публикации — см. чек-лист ниже");
+      } else {
+        setActionError(typeof err.detail === "string" ? err.detail : "Не удалось перевести в ready_for_publish");
+      }
+    }
+  };
+
   const handleRetryPublish = async (force = false) => {
     if (!taskId) return;
     setActionError(null);
@@ -504,9 +526,30 @@ export default function TaskDetailPage() {
                   ✕ Отмена
                 </button>
               )}
+              {data && (data.task.status === "done" || data.task.status === "ready_for_review") && (
+                <button
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#0ea5e9", color: "#fff", fontWeight: 600, cursor: "pointer" }}
+                  onClick={handleMarkReadyForPublish}
+                >
+                  🚀 Ready for Publish
+                </button>
+              )}
             </div>
           </div>
           {actionError && <div style={{ color: "var(--error)", marginTop: 8 }}>{actionError}</div>}
+          {/* Чек-лист готовности к публикации */}
+          {readyChecks && (
+            <div style={{ marginTop: 8, padding: "10px 14px", background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6 }}>Чек-лист публикации:</div>
+              {readyChecks.map((c, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12, padding: "3px 0" }}>
+                  <span style={{ fontSize: 14 }}>{c.ok ? "✅" : "❌"}</span>
+                  <span style={{ fontWeight: 600, minWidth: 120 }}>{c.check}</span>
+                  <span style={{ color: c.ok ? "#166534" : "#991b1b" }}>{c.detail}</span>
+                </div>
+              ))}
+            </div>
+          )}
           {data && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8, color: "#475569", fontSize: 14 }}>
               <div>
