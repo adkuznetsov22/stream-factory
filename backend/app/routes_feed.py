@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db import get_session
 from app.services.dedupe import compute_candidate_signature, find_duplicate
+from app.services.simhash import compute_text_simhash, simhash_to_hex
 from app.models import (
     Brief,
     Candidate,
@@ -158,7 +159,7 @@ async def approve_candidate(
     if candidate.status not in (CandidateStatus.new.value, CandidateStatus.rejected.value):
         raise HTTPException(status_code=400, detail=f"Cannot approve candidate with status {candidate.status}")
 
-    # Duplicate check via content_signature
+    # Exact duplicate check via content_signature
     sig = (candidate.meta or {}).get("content_signature")
     if sig:
         dup = await find_duplicate(session, project_id, sig, exclude_candidate_id=candidate.id)
@@ -169,6 +170,29 @@ async def approve_candidate(
                     "error": "duplicate",
                     "duplicate_candidate_id": dup.id,
                     "message": f"Duplicate of candidate #{dup.id} (status={dup.status})",
+                },
+            )
+
+    # Near-duplicate check via SimHash
+    sh_hex = (candidate.meta or {}).get("content_simhash64")
+    if sh_hex:
+        from app.services.simhash import find_near_duplicate
+        # Load project for dedupe_settings threshold
+        _proj = await session.get(Project, project_id)
+        _dedupe = ((_proj.meta or {}).get("dedupe_settings") or {}) if _proj else {}
+        _max_dist = _dedupe.get("simhash_max_distance", 6)
+        near_dup, dist = await find_near_duplicate(
+            session, project_id, sh_hex,
+            max_distance=_max_dist, exclude_id=candidate.id,
+        )
+        if near_dup:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "near_duplicate",
+                    "duplicate_candidate_id": near_dup.id,
+                    "distance": dist,
+                    "message": f"Near-duplicate of candidate #{near_dup.id} (distance={dist})",
                 },
             )
 
@@ -387,6 +411,16 @@ async def _upsert_candidate(
         meta = candidate.meta or {}
         meta["content_signature"] = sig
         meta["content_signature_source"] = sig_source
+        candidate.meta = meta
+
+    # Compute simhash for near-duplicate detection
+    from app.services.dedupe import extract_candidate_text
+    cand_text, _ = extract_candidate_text(candidate)
+    if cand_text:
+        sh = compute_text_simhash(cand_text)
+        meta = candidate.meta or {}
+        meta["content_simhash64"] = simhash_to_hex(sh)
+        meta["content_simhash_source"] = sig_source
         candidate.meta = meta
 
     session.add(candidate)

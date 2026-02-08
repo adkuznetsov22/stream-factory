@@ -187,7 +187,7 @@ async def run_auto_approve(
     skipped: list[dict] = []
 
     for candidate in candidates:
-        # ── Duplicate check via content_signature ─────────
+        # ── Exact duplicate check via content_signature ────
         sig = (candidate.meta or {}).get("content_signature")
         if sig:
             from app.services.dedupe import find_duplicate
@@ -197,6 +197,24 @@ async def run_auto_approve(
                     "candidate_id": candidate.id,
                     "score": candidate.virality_score,
                     "reason": f"duplicate: same content as #{dup.id} (status={dup.status})",
+                })
+                continue
+
+        # ── Near-duplicate check via SimHash ──────────────
+        sh_hex = (candidate.meta or {}).get("content_simhash64")
+        if sh_hex:
+            from app.services.simhash import find_near_duplicate
+            _dedupe = ((project.meta or {}).get("dedupe_settings") or {})
+            _max_dist = _dedupe.get("simhash_max_distance", 6)
+            near_dup, dist = await find_near_duplicate(
+                session, project_id, sh_hex,
+                max_distance=_max_dist, exclude_id=candidate.id,
+            )
+            if near_dup:
+                skipped.append({
+                    "candidate_id": candidate.id,
+                    "score": candidate.virality_score,
+                    "reason": f"near_duplicate: #{near_dup.id} d={dist}",
                 })
                 continue
 

@@ -1246,21 +1246,31 @@ async def handle_speech_to_text(ctx: StepContext, params: dict) -> dict:
 
 
 def _update_content_signature(ctx: StepContext, transcript: str):
-    """Update content_signature on the publish task's linked candidate using transcript."""
+    """Update content_signature + simhash on the publish task's linked candidate using transcript."""
     if not transcript or not transcript.strip():
         return
     try:
         from app.services.dedupe import compute_signature
+        from app.services.simhash import compute_text_simhash, simhash_to_hex
+
         sig = compute_signature(transcript)
-        if sig and hasattr(ctx, "publish_task") and ctx.publish_task:
+        sh = compute_text_simhash(transcript)
+        sh_hex = simhash_to_hex(sh)
+
+        if hasattr(ctx, "publish_task") and ctx.publish_task:
             task = ctx.publish_task
             if hasattr(task, "candidate") and task.candidate:
                 meta = task.candidate.meta or {}
-                meta["content_signature"] = sig
-                meta["content_signature_source"] = "whisper"
+                if sig:
+                    meta["content_signature"] = sig
+                    meta["content_signature_source"] = "whisper"
+                meta["content_simhash64"] = sh_hex
+                meta["content_simhash_source"] = "whisper"
                 task.candidate.meta = meta
+
         ctx.outputs["content_signature"] = sig
         ctx.outputs["content_signature_source"] = "whisper"
+        ctx.outputs["content_simhash64"] = sh_hex
     except Exception:
         pass  # non-critical
 

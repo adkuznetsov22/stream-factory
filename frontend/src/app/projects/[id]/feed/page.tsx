@@ -198,7 +198,9 @@ export default function ProjectFeedPage() {
       } else if (res.status === 409) {
         const err = await res.json().catch(() => ({ detail: {} }));
         const detail = typeof err.detail === "object" ? err.detail : {};
-        if (detail.error === "duplicate" && detail.duplicate_candidate_id) {
+        if (detail.error === "near_duplicate" && detail.duplicate_candidate_id) {
+          showToast(`Почти дубль #${detail.duplicate_candidate_id} (d=${detail.distance})`, "error");
+        } else if (detail.error === "duplicate" && detail.duplicate_candidate_id) {
           showToast(`Дубликат кандидата #${detail.duplicate_candidate_id}`, "error");
         } else {
           showToast("Кандидат уже существует", "error");
@@ -417,26 +419,62 @@ export default function ProjectFeedPage() {
                       </div>
                     )}
                     {(() => {
+                      // Exact duplicate badge
                       const sig = c.meta?.content_signature as string | undefined;
-                      if (!sig || c.status === "APPROVED" || c.status === "USED") return null;
-                      const dup = candidates.find(
-                        o => o.id !== c.id
-                          && (o.meta?.content_signature as string) === sig
-                          && (o.status === "APPROVED" || o.status === "USED")
-                      );
-                      if (!dup) return null;
-                      return (
-                        <div
-                          style={{
-                            padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
-                            background: "#ef4444", color: "#fff", cursor: "pointer",
-                          }}
-                          title={`Дубликат кандидата #${dup.id}`}
-                          onClick={() => showToast(`Дубликат #${dup.id} (${dup.status})`, "error")}
-                        >
-                          DUP #{dup.id}
-                        </div>
-                      );
+                      if (sig && c.status !== "APPROVED" && c.status !== "USED") {
+                        const dup = candidates.find(
+                          o => o.id !== c.id
+                            && (o.meta?.content_signature as string) === sig
+                            && (o.status === "APPROVED" || o.status === "USED")
+                        );
+                        if (dup) return (
+                          <div
+                            style={{
+                              padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                              background: "#ef4444", color: "#fff", cursor: "pointer",
+                            }}
+                            title={`Дубликат кандидата #${dup.id}`}
+                            onClick={() => showToast(`Дубликат #${dup.id} (${dup.status})`, "error")}
+                          >
+                            DUP #{dup.id}
+                          </div>
+                        );
+                      }
+                      // Near-duplicate badge (SimHash hamming via hex nibble XOR)
+                      const sh = c.meta?.content_simhash64 as string | undefined;
+                      if (sh && sh.length === 16 && c.status !== "APPROVED" && c.status !== "USED") {
+                        const popcount4 = [0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4];
+                        const hexHamming = (a: string, b: string) => {
+                          let d = 0;
+                          for (let i = 0; i < 16; i++) {
+                            d += popcount4[parseInt(a[i], 16) ^ parseInt(b[i], 16)];
+                          }
+                          return d;
+                        };
+                        let bestDup: Candidate | null = null;
+                        let bestDist = 99;
+                        for (const o of candidates) {
+                          if (o.id === c.id) continue;
+                          if (o.status !== "APPROVED" && o.status !== "USED") continue;
+                          const oSh = o.meta?.content_simhash64 as string | undefined;
+                          if (!oSh || oSh.length !== 16) continue;
+                          const dist = hexHamming(sh, oSh);
+                          if (dist <= 6 && dist < bestDist) { bestDist = dist; bestDup = o; }
+                        }
+                        if (bestDup) return (
+                          <div
+                            style={{
+                              padding: "4px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                              background: "#f97316", color: "#fff", cursor: "pointer",
+                            }}
+                            title={`Почти дубль #${bestDup.id} (d=${bestDist})`}
+                            onClick={() => showToast(`Почти дубль #${bestDup!.id} (d=${bestDist})`, "error")}
+                          >
+                            SIM #{bestDup.id} d={bestDist}
+                          </div>
+                        );
+                      }
+                      return null;
                     })()}
                   </div>
                   {/* Virality score */}
