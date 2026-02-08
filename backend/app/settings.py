@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = Field(default=None, validation_alias=AliasChoices("TELEGRAM_CHAT_ID", "STREAM_FACTORY_TELEGRAM_CHAT_ID"))
     admin_password: str | None = Field(default=None, validation_alias=AliasChoices("ADMIN_PASSWORD", "STREAM_FACTORY_ADMIN_PASSWORD"))
     scheduler_enabled: bool = Field(default=True, validation_alias=AliasChoices("SCHEDULER_ENABLED", "STREAM_FACTORY_SCHEDULER_ENABLED"))
+    auto_process_enabled: bool = Field(default=True, validation_alias=AliasChoices("AUTO_PROCESS_ENABLED", "STREAM_FACTORY_AUTO_PROCESS_ENABLED"))
+    auto_process_interval_minutes: int = Field(default=5, validation_alias=AliasChoices("AUTO_PROCESS_INTERVAL_MINUTES", "STREAM_FACTORY_AUTO_PROCESS_INTERVAL_MINUTES"))
+    auto_process_max_parallel: int = Field(default=2, validation_alias=AliasChoices("AUTO_PROCESS_MAX_PARALLEL", "STREAM_FACTORY_AUTO_PROCESS_MAX_PARALLEL"))
+    auto_process_max_parallel_per_destination: int = Field(default=1, validation_alias=AliasChoices("AUTO_PROCESS_MAX_PARALLEL_PER_DESTINATION", "STREAM_FACTORY_AUTO_PROCESS_MAX_PARALLEL_PER_DESTINATION"))
 
     @property
     def async_database_url(self) -> str:

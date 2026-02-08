@@ -2061,6 +2061,20 @@ async def trigger_auto_approve(
     return await run_auto_approve(session, project_id, dry_run=dry_run)
 
 
+@router.post("/scheduler/auto-process", response_model=dict)
+async def trigger_auto_process(
+    dry_run: bool = Query(default=False),
+    session: AsyncSession = SessionDep,
+):
+    """Manually trigger auto-process for queued tasks.
+
+    Picks queued tasks respecting global and per-destination concurrency limits.
+    Pass ?dry_run=true to preview without starting tasks.
+    """
+    from app.services.auto_process_service import run_auto_process
+    return await run_auto_process(session, dry_run=dry_run)
+
+
 @router.get("/export-profiles", response_model=list[ExportProfileRead])
 async def list_export_profiles(session: AsyncSession = SessionDep):
     """Список всех доступных export-профилей."""

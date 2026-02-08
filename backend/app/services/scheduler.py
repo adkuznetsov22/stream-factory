@@ -37,6 +37,7 @@ LOCK_SYNC_PUBLISHED_METRICS = 900_003
 LOCK_AGGREGATE_SNAPSHOTS = 900_004
 LOCK_CALIBRATE_SCORING = 900_005
 LOCK_AUTO_APPROVE = 900_006
+LOCK_AUTO_PROCESS = 900_007
 
 
 class SchedulerService:
@@ -146,6 +147,17 @@ class SchedulerService:
             name="Auto-approve candidates",
             replace_existing=True,
         )
+
+        # Auto-process: start pipeline for queued tasks
+        settings = get_settings()
+        if settings.auto_process_enabled:
+            self.scheduler.add_job(
+                self._run_auto_process,
+                IntervalTrigger(minutes=settings.auto_process_interval_minutes),
+                id="auto_process",
+                name="Auto-process queued tasks",
+                replace_existing=True,
+            )
         
         self.scheduler.start()
         self._running = True
@@ -336,6 +348,36 @@ class SchedulerService:
                 return result
             finally:
                 await self._release_advisory_lock(session, LOCK_AUTO_APPROVE)
+
+    async def _run_auto_process(self):
+        """Auto-process queued tasks with concurrency limits.
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        settings = get_settings()
+        if not settings.auto_process_enabled:
+            return None
+
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_AUTO_PROCESS)
+            if not acquired:
+                logger.debug("[auto_process] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[auto_process] LEADER — running auto-process")
+                from app.services.auto_process_service import run_auto_process
+
+                result = await run_auto_process(session)
+
+                logger.info(
+                    "[auto_process] Completed: %d started, %d skipped",
+                    result.get("started_count", 0),
+                    result.get("skipped_count", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_AUTO_PROCESS)
 
     async def _sync_account(self, session: AsyncSession, account):
         """Sync a single account based on platform."""
