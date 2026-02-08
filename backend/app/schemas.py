@@ -115,6 +115,7 @@ class ProjectCreate(BaseModel):
     status: str | None = None
     mode: str | None = None
     settings_json: dict | None = None
+    policy: dict | None = None
     preset_id: int | None = None
 
 
@@ -125,6 +126,7 @@ class ProjectRead(BaseModel):
     status: str
     mode: str
     settings_json: dict | None = None
+    policy: dict | None = None
     preset_id: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -139,6 +141,7 @@ class ProjectUpdate(BaseModel):
     status: str | None = None
     mode: str | None = None
     settings_json: dict | None = None
+    policy: dict | None = None
     preset_id: int | None = None
 
 

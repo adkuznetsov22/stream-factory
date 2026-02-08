@@ -431,6 +431,7 @@ class Project(Base):
     status: Mapped[str] = mapped_column(sa.Text(), nullable=False, server_default="draft")
     mode: Mapped[str] = mapped_column(sa.Text(), nullable=False, server_default="MANUAL")
     settings_json: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    policy: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
     preset_id: Mapped[int | None] = mapped_column(sa.ForeignKey("presets.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

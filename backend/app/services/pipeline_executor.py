@@ -56,6 +56,9 @@ class StepContext:
         self.candidate_meta: dict = {}
         self.brief_data: dict = {}
         
+        # Project policy (required transformations)
+        self.policy: dict = {}
+        
         # Step outputs accumulator
         self.outputs: dict[str, Any] = {}
     
@@ -900,7 +903,13 @@ async def handle_package(ctx: StepContext, params: dict) -> dict:
 
 @PipelineExecutor.register("T18_QC")
 async def handle_qc(ctx: StepContext, params: dict) -> dict:
-    """Quality control check."""
+    """Quality control check.
+
+    Includes project policy enforcement: if the project requires certain
+    transformations (voice change, caption rewrite, visual transform, hook
+    rewrite) but none of the executed pipeline steps correspond to those
+    requirements, QC will fail with a clear error.
+    """
     input_path = ctx.get_input_video()
     
     min_bitrate = params.get("min_bitrate", "2M")
@@ -920,7 +929,44 @@ async def handle_qc(ctx: StepContext, params: dict) -> dict:
     warnings = []
     errors = []
     
-    # Check video stream
+    # ── Policy enforcement ──────────────────────────────────────
+    policy = ctx.policy or {}
+    executed_tools = set(ctx.outputs.keys())
+
+    POLICY_TOOL_MAP = {
+        "require_voice_change": {
+            "tools": {"T10_VOICE_CONVERT", "G03_TTS", "T12_REPLACE_AUDIO"},
+            "label": "Замена голоса / озвучка (T10_VOICE_CONVERT / G03_TTS / T12_REPLACE_AUDIO)",
+        },
+        "require_caption_rewrite": {
+            "tools": {"T13_BUILD_CAPTIONS", "T14_BURN_CAPTIONS", "G02_CAPTIONS"},
+            "label": "Перезапись субтитров (T13_BUILD_CAPTIONS / T14_BURN_CAPTIONS / G02_CAPTIONS)",
+        },
+        "require_visual_transform": {
+            "tools": {"T15_EFFECTS", "T04_CROP_RESIZE", "T16_WATERMARK"},
+            "label": "Визуальная трансформация (T15_EFFECTS / T04_CROP_RESIZE / T16_WATERMARK)",
+        },
+        "require_hook_rewrite": {
+            "tools": {"G01_SCRIPT", "T21_TRIM"},
+            "label": "Переписывание хука (G01_SCRIPT / T21_TRIM)",
+        },
+    }
+
+    policy_violations = []
+    for policy_key, mapping in POLICY_TOOL_MAP.items():
+        if policy.get(policy_key):
+            if not executed_tools & mapping["tools"]:
+                policy_violations.append(
+                    f"Policy '{policy_key}' requires: {mapping['label']}, "
+                    f"but none of [{', '.join(sorted(mapping['tools']))}] were executed"
+                )
+
+    if policy_violations:
+        for v in policy_violations:
+            errors.append(v)
+            ctx.log(f"[T18_QC] POLICY VIOLATION: {v}")
+
+    # ── Video quality checks ────────────────────────────────────
     video_stream = None
     audio_stream = None
     for stream in probe_data.get("streams", []):
@@ -961,6 +1007,7 @@ async def handle_qc(ctx: StepContext, params: dict) -> dict:
         "passed": passed,
         "warnings": warnings,
         "errors": errors,
+        "policy_violations": policy_violations,
         "video_info": {
             "width": video_stream.get("width") if video_stream else None,
             "height": video_stream.get("height") if video_stream else None,

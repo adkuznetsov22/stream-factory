@@ -2,6 +2,13 @@
 
 import { useEffect, useState } from "react";
 
+type Policy = {
+  require_voice_change?: boolean;
+  require_caption_rewrite?: boolean;
+  require_visual_transform?: boolean;
+  require_hook_rewrite?: boolean;
+};
+
 type Project = {
   id: number;
   name: string;
@@ -9,6 +16,7 @@ type Project = {
   status: string;
   mode: string;
   preset_id?: number | null;
+  policy?: Policy | null;
 };
 
 type Source = { id: number; platform: string; social_account_id: number };
@@ -228,6 +236,34 @@ export default function ProjectsPage() {
                           <option value="MANUAL">Ручной</option>
                           <option value="AUTO">Автоматический</option>
                         </select>
+                      </div>
+                    </div>
+
+                    {/* Policy */}
+                    <div style={{ marginBottom: 24 }}>
+                      <span style={{ fontWeight: 600, fontSize: 14, display: "block", marginBottom: 12 }}>Политика обработки</span>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                        {([
+                          ["require_voice_change", "Замена голоса"],
+                          ["require_caption_rewrite", "Перезапись субтитров"],
+                          ["require_visual_transform", "Визуальная трансформация"],
+                          ["require_hook_rewrite", "Переписывание хука"],
+                        ] as const).map(([key, label]) => (
+                          <label key={key} style={{
+                            display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
+                            background: "var(--bg-muted)", borderRadius: 8, cursor: "pointer", fontSize: 13,
+                          }}>
+                            <input
+                              type="checkbox"
+                              checked={!!(p.policy as Policy)?.[key as keyof Policy]}
+                              onChange={e => {
+                                const newPolicy = { ...(p.policy || {}), [key]: e.target.checked };
+                                updateProject(p.id, { policy: newPolicy } as Partial<Project>);
+                              }}
+                            />
+                            <span>{label}</span>
+                          </label>
+                        ))}
                       </div>
                     </div>
 

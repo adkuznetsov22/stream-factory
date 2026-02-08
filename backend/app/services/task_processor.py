@@ -92,6 +92,10 @@ class TaskProcessor:
             ctx.candidate_meta = task.artifacts.get("candidate_meta", {})
             ctx.brief_data = task.artifacts.get("brief", {})
         
+        # Populate project policy for QC enforcement
+        if project and project.policy and isinstance(project.policy, dict):
+            ctx.policy = project.policy
+        
         # Build step list
         steps = self._build_steps(preset, task)
         
