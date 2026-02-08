@@ -33,22 +33,41 @@ DETAIL_RETENTION_DAYS = 30     # keep detailed snapshots 30 days
 WEEKLY_RETENTION_DAYS = 180    # keep daily aggregates 180 days, then weekly
 
 
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    """Guarantee a datetime is timezone-aware (UTC).
+
+    Postgres timestamptz always stores UTC, but if the value somehow
+    arrives as naive (e.g. via raw SQL or tests), attach UTC to prevent
+    TypeError on arithmetic with aware datetimes.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _should_snapshot(task: PublishTask, now: datetime) -> bool:
-    """Determine if this task needs a new snapshot based on age policy."""
-    if not task.published_at:
+    """Determine if this task needs a new snapshot based on age policy.
+
+    All datetime comparisons are in UTC.
+    """
+    published_at = _ensure_utc(task.published_at)
+    if not published_at:
         return True
 
-    hours_since_publish = (now - task.published_at).total_seconds() / 3600
+    hours_since_publish = (now - published_at).total_seconds() / 3600
 
     if hours_since_publish <= FRESH_WINDOW_HOURS:
         # Fresh video: snapshot every tick
         return True
 
     # Stale video: check if enough time passed since last snapshot
-    if not task.last_metrics_at:
+    last_at = _ensure_utc(task.last_metrics_at)
+    if not last_at:
         return True
 
-    hours_since_last = (now - task.last_metrics_at).total_seconds() / 3600
+    hours_since_last = (now - last_at).total_seconds() / 3600
     return hours_since_last >= STALE_INTERVAL_HOURS
 
 
@@ -110,11 +129,11 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
                 if not metrics:
                     continue
 
-                # Compute hours since publish
+                # Compute hours since publish (UTC-safe)
                 hours_since = None
-                if task.published_at:
-                    delta = now - task.published_at
-                    hours_since = int(delta.total_seconds() / 3600)
+                pub_at = _ensure_utc(task.published_at)
+                if pub_at:
+                    hours_since = int((now - pub_at).total_seconds() / 3600)
 
                 # Find linked candidate
                 candidate_id = None
