@@ -8,13 +8,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db import get_session
-from app.models import Candidate, CandidateStatus, Project, ProjectDestination, PublishTask
+from app.models import (
+    Candidate,
+    CandidateStatus,
+    InstagramPost,
+    InstagramProfile,
+    Project,
+    ProjectDestination,
+    ProjectSource,
+    PublishTask,
+    SocialAccount,
+    TikTokProfile,
+    TikTokVideo,
+    VKClip,
+    VKProfile,
+    VKVideo,
+    YouTubeChannel,
+    YouTubeVideo,
+)
 from app.schemas import (
     CandidateApproveResponse,
     CandidateCreate,
     CandidateRateRequest,
     CandidateRead,
 )
+from app.services.virality import calculate_virality_score
 
 router = APIRouter(prefix="/api", tags=["feed"])
 SessionDep = Depends(get_session)
@@ -212,3 +230,298 @@ async def rate_candidate(
     await session.commit()
     await session.refresh(candidate)
     return candidate
+
+
+# ── Sync sources into feed ─────────────────────────────────────
+
+async def _get_subscribers(session: AsyncSession, account_id: int, platform: str) -> int | None:
+    """Get subscriber/follower count for an account."""
+    if platform == "TikTok":
+        profile = await session.scalar(select(TikTokProfile).where(TikTokProfile.account_id == account_id))
+        return profile.followers if profile else None
+    elif platform == "YouTube":
+        channel = await session.scalar(select(YouTubeChannel).where(YouTubeChannel.account_id == account_id))
+        return channel.subscribers if channel else None
+    elif platform == "VK":
+        profile = await session.scalar(select(VKProfile).where(VKProfile.account_id == account_id))
+        return profile.members_count or profile.followers_count if profile else None
+    elif platform == "Instagram":
+        profile = await session.scalar(select(InstagramProfile).where(InstagramProfile.account_id == account_id))
+        return profile.followers if profile else None
+    return None
+
+
+async def _upsert_candidate(
+    session: AsyncSession,
+    project_id: int,
+    platform: str,
+    platform_video_id: str,
+    *,
+    url: str | None,
+    author: str | None,
+    title: str | None,
+    caption: str | None,
+    thumbnail_url: str | None,
+    published_at: datetime | None,
+    views: int | None,
+    likes: int | None,
+    comments: int | None,
+    shares: int | None,
+    subscribers: int | None,
+) -> tuple[Candidate, bool]:
+    """Upsert a candidate. Returns (candidate, is_new)."""
+    res = await session.execute(
+        select(Candidate).where(
+            Candidate.project_id == project_id,
+            Candidate.platform == platform,
+            Candidate.platform_video_id == platform_video_id,
+        )
+    )
+    candidate = res.scalar_one_or_none()
+    is_new = candidate is None
+
+    if is_new:
+        candidate = Candidate(
+            project_id=project_id,
+            platform=platform,
+            platform_video_id=platform_video_id,
+            status=CandidateStatus.new.value,
+        )
+
+    candidate.url = url
+    candidate.author = author
+    candidate.title = title
+    candidate.caption = caption
+    candidate.thumbnail_url = thumbnail_url
+    candidate.published_at = published_at
+    candidate.views = views
+    candidate.likes = likes
+    candidate.comments = comments
+    candidate.shares = shares
+    candidate.subscribers = subscribers
+    candidate.virality_score = calculate_virality_score(
+        views=views, likes=likes, comments=comments, shares=shares,
+        published_at=published_at, subscribers=subscribers,
+    )
+    session.add(candidate)
+    return candidate, is_new
+
+
+async def _sync_tiktok_source(session: AsyncSession, project_id: int, source: ProjectSource) -> tuple[int, int]:
+    """Sync TikTok videos from a source account into candidates. Returns (added, updated)."""
+    added, updated = 0, 0
+    account_id = source.social_account_id
+    subs = await _get_subscribers(session, account_id, "TikTok")
+    account = await session.get(SocialAccount, account_id)
+    author = account.handle if account else None
+
+    res = await session.execute(
+        select(TikTokVideo).where(TikTokVideo.account_id == account_id).order_by(TikTokVideo.published_at.desc().nullslast())
+    )
+    for video in res.scalars().all():
+        _, is_new = await _upsert_candidate(
+            session, project_id, "TikTok", video.video_id,
+            url=video.permalink, author=author, title=video.title, caption=video.title,
+            thumbnail_url=video.thumbnail_url, published_at=video.published_at,
+            views=video.views, likes=video.likes, comments=video.comments,
+            shares=video.shares, subscribers=subs,
+        )
+        if is_new:
+            added += 1
+        else:
+            updated += 1
+    return added, updated
+
+
+async def _sync_youtube_source(session: AsyncSession, project_id: int, source: ProjectSource) -> tuple[int, int]:
+    added, updated = 0, 0
+    account_id = source.social_account_id
+    subs = await _get_subscribers(session, account_id, "YouTube")
+    account = await session.get(SocialAccount, account_id)
+    author = account.handle if account else None
+
+    res = await session.execute(
+        select(YouTubeVideo).where(YouTubeVideo.account_id == account_id).order_by(YouTubeVideo.published_at.desc().nullslast())
+    )
+    for video in res.scalars().all():
+        _, is_new = await _upsert_candidate(
+            session, project_id, "YouTube", video.video_id,
+            url=video.permalink, author=author, title=video.title, caption=video.description,
+            thumbnail_url=video.thumbnail_url, published_at=video.published_at,
+            views=video.views, likes=video.likes, comments=video.comments,
+            shares=None, subscribers=subs,
+        )
+        if is_new:
+            added += 1
+        else:
+            updated += 1
+    return added, updated
+
+
+async def _sync_vk_source(session: AsyncSession, project_id: int, source: ProjectSource) -> tuple[int, int]:
+    added, updated = 0, 0
+    account_id = source.social_account_id
+    subs = await _get_subscribers(session, account_id, "VK")
+    account = await session.get(SocialAccount, account_id)
+    author = account.handle if account else None
+
+    res = await session.execute(
+        select(VKVideo).where(VKVideo.account_id == account_id).order_by(VKVideo.published_at.desc().nullslast())
+    )
+    for video in res.scalars().all():
+        vid_id = video.vk_full_id or f"{video.vk_owner_id}_{video.video_id}"
+        _, is_new = await _upsert_candidate(
+            session, project_id, "VK", vid_id,
+            url=video.permalink, author=author, title=video.title, caption=video.description,
+            thumbnail_url=video.thumbnail_url, published_at=video.published_at,
+            views=video.views, likes=video.likes, comments=video.comments,
+            shares=video.reposts, subscribers=subs,
+        )
+        if is_new:
+            added += 1
+        else:
+            updated += 1
+
+    # Also sync VK clips
+    res = await session.execute(
+        select(VKClip).where(VKClip.account_id == account_id).order_by(VKClip.published_at.desc().nullslast())
+    )
+    for clip in res.scalars().all():
+        clip_id = f"clip_{clip.vk_owner_id}_{clip.clip_id}"
+        _, is_new = await _upsert_candidate(
+            session, project_id, "VK", clip_id,
+            url=clip.permalink, author=author, title=clip.title, caption=clip.description,
+            thumbnail_url=clip.thumbnail_url, published_at=clip.published_at,
+            views=clip.views, likes=clip.likes, comments=clip.comments,
+            shares=getattr(clip, "reposts", None), subscribers=subs,
+        )
+        if is_new:
+            added += 1
+        else:
+            updated += 1
+    return added, updated
+
+
+async def _sync_instagram_source(session: AsyncSession, project_id: int, source: ProjectSource) -> tuple[int, int]:
+    added, updated = 0, 0
+    account_id = source.social_account_id
+    subs = await _get_subscribers(session, account_id, "Instagram")
+    account = await session.get(SocialAccount, account_id)
+    author = account.handle if account else None
+
+    res = await session.execute(
+        select(InstagramPost).where(InstagramPost.account_id == account_id).order_by(InstagramPost.published_at.desc().nullslast())
+    )
+    for post in res.scalars().all():
+        _, is_new = await _upsert_candidate(
+            session, project_id, "Instagram", post.post_id,
+            url=post.permalink, author=author, title=None, caption=post.caption,
+            thumbnail_url=post.thumbnail_url, published_at=post.published_at,
+            views=post.views, likes=post.likes, comments=post.comments,
+            shares=None, subscribers=subs,
+        )
+        if is_new:
+            added += 1
+        else:
+            updated += 1
+    return added, updated
+
+
+_PLATFORM_SYNCERS = {
+    "TikTok": _sync_tiktok_source,
+    "YouTube": _sync_youtube_source,
+    "VK": _sync_vk_source,
+    "Instagram": _sync_instagram_source,
+}
+
+
+@router.post("/projects/{project_id}/sync-sources")
+async def sync_project_sources(
+    project_id: int,
+    session: AsyncSession = SessionDep,
+):
+    """Sync all project sources into the candidate feed.
+
+    Reads existing platform videos (TikTok, YouTube, VK, Instagram) from
+    each ProjectSource account, upserts into Candidate table, and recalculates
+    virality scores.
+    """
+    res = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .options(selectinload(Project.sources))
+    )
+    project = res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not project.sources:
+        raise HTTPException(status_code=400, detail="Project has no sources configured")
+
+    total_added = 0
+    total_updated = 0
+    source_results = []
+
+    for source in project.sources:
+        if not source.is_active:
+            continue
+        syncer = _PLATFORM_SYNCERS.get(source.platform)
+        if not syncer:
+            source_results.append({
+                "source_id": source.id,
+                "platform": source.platform,
+                "account_id": source.social_account_id,
+                "status": "skipped",
+                "reason": f"Unsupported platform: {source.platform}",
+            })
+            continue
+        try:
+            added, updated = await syncer(session, project_id, source)
+            total_added += added
+            total_updated += updated
+            source_results.append({
+                "source_id": source.id,
+                "platform": source.platform,
+                "account_id": source.social_account_id,
+                "status": "ok",
+                "added": added,
+                "updated": updated,
+            })
+        except Exception as exc:
+            source_results.append({
+                "source_id": source.id,
+                "platform": source.platform,
+                "account_id": source.social_account_id,
+                "status": "error",
+                "error": str(exc),
+            })
+
+    await session.commit()
+
+    # Get top-5 by virality_score
+    top5_res = await session.execute(
+        select(Candidate)
+        .where(Candidate.project_id == project_id)
+        .order_by(Candidate.virality_score.desc().nullslast())
+        .limit(5)
+    )
+    top5 = [
+        {
+            "id": c.id,
+            "platform": c.platform,
+            "author": c.author,
+            "title": c.title,
+            "virality_score": c.virality_score,
+            "views": c.views,
+            "status": c.status,
+        }
+        for c in top5_res.scalars().all()
+    ]
+
+    return {
+        "project_id": project_id,
+        "total_added": total_added,
+        "total_updated": total_updated,
+        "sources": source_results,
+        "top5": top5,
+    }
