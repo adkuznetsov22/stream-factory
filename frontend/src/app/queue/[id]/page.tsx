@@ -523,6 +523,11 @@ export default function TaskDetailPage() {
                 </div>
               )}
               {data.task.status === "error" && data.task.status_label && <div style={{ color: "var(--error)" }}>{data.task.status_label}</div>}
+              {(data as any).celery_task_id && (
+                <div style={{ fontSize: 12, color: "#94a3b8" }}>
+                  Celery ID: <code style={{ background: "#f1f5f9", padding: "1px 6px", borderRadius: 4, fontSize: 11 }}>{(data as any).celery_task_id}</code>
+                </div>
+              )}
             </div>
           )}
           {loading && <div style={{ color: "var(--text-tertiary)", marginTop: 8 }}>Загрузка...</div>}

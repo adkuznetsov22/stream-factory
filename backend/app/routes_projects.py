@@ -29,6 +29,7 @@ from app.models import (
     ProjectSource,
     PublishTask,
     SocialAccount,
+    StepResult,
     TikTokVideo,
     VKClip,
     VKVideo,
@@ -1503,6 +1504,7 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
         "publish": publish_info,
         "candidate": candidate_info,
         "step_results": step_results_data,
+        "celery_task_id": task.celery_task_id,
     }
     return response
 
@@ -1688,6 +1690,23 @@ async def pause_task(task_id: int, session: AsyncSession = SessionDep, reason: s
         )
 
     now = datetime.now(timezone.utc)
+    revoked = False
+
+    # If queued with celery_task_id — revoke before it starts
+    if task.status == "queued" and task.celery_task_id:
+        try:
+            from app.worker.celery_app import celery_app as _celery
+            _celery.control.revoke(task.celery_task_id, terminate=False)
+            revoked = True
+            session.add(StepResult(
+                task_id=task_id, step_index=9996, tool_id="CONTROL",
+                step_name="Revoke queued task (pause)",
+                status="done",
+                output_data={"action": "revoke", "celery_task_id": task.celery_task_id},
+                started_at=now, completed_at=now,
+            ))
+        except Exception as e:
+            logger.warning(f"[pause] Failed to revoke celery task {task.celery_task_id}: {e}")
 
     # If not actively processing, pause immediately
     if task.status in ("queued", "ready_for_review", "done"):
@@ -1699,7 +1718,7 @@ async def pause_task(task_id: int, session: AsyncSession = SessionDep, reason: s
     await session.commit()
     await session.refresh(task)
 
-    return {"ok": True, "task_id": task_id, "status": task.status, "pause_requested_at": task.pause_requested_at.isoformat() if task.pause_requested_at else None}
+    return {"ok": True, "task_id": task_id, "status": task.status, "revoked": revoked, "pause_requested_at": task.pause_requested_at.isoformat() if task.pause_requested_at else None}
 
 
 @router.post("/publish-tasks/{task_id}/resume", response_model=dict)
@@ -1752,8 +1771,25 @@ async def cancel_task(task_id: int, session: AsyncSession = SessionDep, reason: 
         )
 
     now = datetime.now(timezone.utc)
+    revoked = False
     task.cancel_requested_at = now
     task.cancel_reason = reason
+
+    # If queued with celery_task_id — revoke before it starts
+    if task.status == "queued" and task.celery_task_id:
+        try:
+            from app.worker.celery_app import celery_app as _celery
+            _celery.control.revoke(task.celery_task_id, terminate=False)
+            revoked = True
+            session.add(StepResult(
+                task_id=task_id, step_index=9996, tool_id="CONTROL",
+                step_name="Revoke queued task (cancel)",
+                status="done",
+                output_data={"action": "revoke", "celery_task_id": task.celery_task_id},
+                started_at=now, completed_at=now,
+            ))
+        except Exception as e:
+            logger.warning(f"[cancel] Failed to revoke celery task {task.celery_task_id}: {e}")
 
     # If not actively processing, cancel immediately
     if task.status in ("queued", "paused", "ready_for_review", "done", "error"):
@@ -1764,7 +1800,7 @@ async def cancel_task(task_id: int, session: AsyncSession = SessionDep, reason: 
     await session.commit()
     await session.refresh(task)
 
-    return {"ok": True, "task_id": task_id, "status": task.status, "cancel_requested_at": task.cancel_requested_at.isoformat() if task.cancel_requested_at else None}
+    return {"ok": True, "task_id": task_id, "status": task.status, "revoked": revoked, "cancel_requested_at": task.cancel_requested_at.isoformat() if task.cancel_requested_at else None}
 
 
 @router.post("/publish-tasks/{task_id}/process-v2", response_model=dict)

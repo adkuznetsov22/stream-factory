@@ -28,6 +28,9 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
+    # visibility_timeout MUST be > task_time_limit to prevent redelivery
+    # of long-running tasks. 7h = 25200s > 6h = 21600s.
+    broker_transport_options={"visibility_timeout": 7 * 3600},  # 25200s
 )
 
 # Auto-discover tasks in app.worker.tasks

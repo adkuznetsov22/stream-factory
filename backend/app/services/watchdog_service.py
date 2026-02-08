@@ -213,5 +213,10 @@ async def get_health(session: AsyncSession) -> dict[str, Any]:
         },
         "scheduler_enabled": settings.scheduler_enabled,
         "watchdog_enabled": settings.watchdog_enabled,
+        "celery_enabled": settings.celery_enabled,
+        "celery": {
+            "task_time_limit_sec": 6 * 3600,
+            "visibility_timeout_sec": 7 * 3600,
+        },
         "last_decisions": last_decisions,
     }
