@@ -158,6 +158,12 @@ export default function ProjectsPage() {
                     {/* Actions */}
                     <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
                       <button
+                        onClick={() => window.location.href = `/projects/${p.id}/feed`}
+                        style={{ padding: "8px 16px", background: "#3b82f620", color: "#3b82f6", borderRadius: 6, fontSize: 13, fontWeight: 500 }}
+                      >
+                        📋 Feed
+                      </button>
+                      <button
                         onClick={() => runNow(p.id)}
                         style={{ padding: "8px 16px", background: "var(--accent)", color: "#fff", borderRadius: 6, fontSize: 13, fontWeight: 500 }}
                       >
