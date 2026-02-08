@@ -14,6 +14,7 @@ const navItems = [
   { href: "/queue", label: "Очередь", icon: "📋" },
   { href: "/moderation", label: "Модерация", icon: "✅" },
   { href: "/dashboard", label: "Статистика", icon: "📊" },
+  { href: "/analytics", label: "Аналитика", icon: "🎯" },
 ];
 
 export default function RootLayout({
