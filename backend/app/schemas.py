@@ -437,6 +437,9 @@ class CandidateRead(BaseModel):
     subscribers: int | None = None
     virality_score: float | None = None
     virality_factors: dict | None = None
+    origin: str = "REPURPOSE"
+    brief_id: int | None = None
+    meta: dict | None = None
     status: str
     manual_rating: int | None = None
     notes: str | None = None
@@ -465,6 +468,9 @@ class CandidateCreate(BaseModel):
     subscribers: int | None = None
     virality_score: float | None = None
     virality_factors: dict | None = None
+    origin: str = "REPURPOSE"
+    brief_id: int | None = None
+    meta: dict | None = None
 
 
 class CandidateRateRequest(BaseModel):
@@ -476,3 +482,50 @@ class CandidateApproveResponse(BaseModel):
     candidate_id: int
     task_id: int
     status: str
+
+
+# ── Briefs ─────────────────────────────────────────────────────
+
+class BriefRead(BaseModel):
+    id: int
+    project_id: int
+    title: str
+    description: str | None = None
+    target_platform: str | None = None
+    style: str | None = None
+    tone: str | None = None
+    language: str = "ru"
+    prompts: dict | None = None
+    assets: dict | None = None
+    settings: dict | None = None
+    status: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class BriefCreate(BaseModel):
+    title: str
+    description: str | None = None
+    target_platform: str | None = None
+    style: str | None = None
+    tone: str | None = None
+    language: str = "ru"
+    prompts: dict | None = None
+    assets: dict | None = None
+    settings: dict | None = None
+
+
+class BriefUpdate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    target_platform: str | None = None
+    style: str | None = None
+    tone: str | None = None
+    language: str | None = None
+    prompts: dict | None = None
+    assets: dict | None = None
+    settings: dict | None = None
+    status: str | None = None

@@ -45,6 +45,8 @@ async def get_project_feed(
     platform: str | None = Query(None, description="Filter by platform"),
     include_used: bool = Query(False, description="Include USED candidates"),
     status_filter: str | None = Query(None, alias="status", description="Filter by status: NEW, APPROVED, REJECTED, USED"),
+    origin: str | None = Query(None, description="Filter by origin: REPURPOSE, GENERATE"),
+    brief_id: int | None = Query(None, description="Filter by brief_id"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     session: AsyncSession = SessionDep,
@@ -61,6 +63,12 @@ async def get_project_feed(
 
     if platform:
         q = q.where(Candidate.platform == platform)
+
+    if origin:
+        q = q.where(Candidate.origin == origin.upper())
+
+    if brief_id is not None:
+        q = q.where(Candidate.brief_id == brief_id)
 
     if status_filter:
         q = q.where(Candidate.status == status_filter.upper())
@@ -113,6 +121,9 @@ async def create_candidate(
         subscribers=data.subscribers,
         virality_score=data.virality_score,
         virality_factors=data.virality_factors,
+        origin=data.origin,
+        brief_id=data.brief_id,
+        meta=data.meta,
         status=CandidateStatus.new.value,
     )
     session.add(candidate)

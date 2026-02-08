@@ -456,6 +456,9 @@ class Project(Base):
     candidates: Mapped[list["Candidate"]] = relationship(
         back_populates="project", cascade="all, delete-orphan", passive_deletes=True
     )
+    briefs: Mapped[list["Brief"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class ProjectSource(Base):
@@ -692,11 +695,41 @@ class StepResult(Base):
     )
 
 
+class CandidateOrigin(str, Enum):
+    repurpose = "REPURPOSE"
+    generate = "GENERATE"
+
+
 class CandidateStatus(str, Enum):
     new = "NEW"
     approved = "APPROVED"
     rejected = "REJECTED"
     used = "USED"
+
+
+class Brief(Base):
+    """Content generation brief for GENERATE mode."""
+    __tablename__ = "briefs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(sa.String(512), nullable=False)
+    description: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    target_platform: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    style: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    tone: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
+    language: Mapped[str] = mapped_column(sa.String(8), nullable=False, server_default="ru")
+    prompts: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    assets: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    settings: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    status: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="draft")
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now(), nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="briefs")
+    candidates: Mapped[list["Candidate"]] = relationship(back_populates="brief")
 
 
 class Candidate(Base):
@@ -730,6 +763,13 @@ class Candidate(Base):
     virality_score: Mapped[float | None] = mapped_column(sa.Float(), nullable=True, index=True)
     virality_factors: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
 
+    # Origin: REPURPOSE (from competitor feed) or GENERATE (from brief/LLM)
+    origin: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="REPURPOSE", index=True)
+    brief_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("briefs.id", ondelete="SET NULL"), nullable=True
+    )
+    meta: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+
     # Status & review
     status: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="NEW", index=True)
     manual_rating: Mapped[int | None] = mapped_column(sa.SmallInteger(), nullable=True)
@@ -751,3 +791,4 @@ class Candidate(Base):
     publish_task: Mapped["PublishTask | None"] = relationship(
         back_populates="candidate", foreign_keys=[linked_publish_task_id]
     )
+    brief: Mapped["Brief | None"] = relationship(back_populates="candidates")
