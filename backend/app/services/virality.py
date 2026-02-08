@@ -22,6 +22,21 @@ class VideoLike(Protocol):
     published_at: datetime | None
 
 
+class ViralityResult:
+    """Result of virality score calculation with factor breakdown."""
+    __slots__ = ("score", "factors")
+
+    def __init__(self, score: float, factors: dict[str, float]):
+        self.score = score
+        self.factors = factors
+
+    def __float__(self) -> float:
+        return self.score
+
+    def __repr__(self) -> str:
+        return f"ViralityResult(score={self.score}, factors={self.factors})"
+
+
 def calculate_virality_score(
     views: int | None,
     likes: int | None,
@@ -30,9 +45,12 @@ def calculate_virality_score(
     published_at: datetime | None,
     *,
     subscribers: int | None = None,
-) -> float:
+) -> ViralityResult:
     """
     Calculate virality score (0-100) for a video.
+    
+    Returns ViralityResult with .score (float) and .factors (dict).
+    ViralityResult supports float() for backward compatibility.
     
     Formula components:
     1. Views velocity: views / days_since_published (normalized)
@@ -47,7 +65,10 @@ def calculate_virality_score(
     - subscriber_ratio: 10%
     """
     if not views or views <= 0:
-        return 0.0
+        return ViralityResult(0.0, {
+            "velocity": 0.0, "engagement": 0.0,
+            "recency": 0.0, "sub_ratio": 0.0,
+        })
     
     now = datetime.now(timezone.utc)
     
@@ -96,11 +117,21 @@ def calculate_virality_score(
         + recency_score * weights["recency"]
         + sub_ratio_score * weights["sub_ratio"]
     )
+
+    factors = {
+        "velocity": round(velocity_score, 2),
+        "engagement": round(engagement_score, 2),
+        "recency": round(recency_score, 2),
+        "sub_ratio": round(sub_ratio_score, 2),
+        "days_old": round(days_old, 1),
+        "engagement_rate": round(engagement_rate, 4),
+        "views_per_day": round(velocity, 1),
+    }
     
-    return round(min(100, max(0, final_score)), 2)
+    return ViralityResult(round(min(100, max(0, final_score)), 2), factors)
 
 
-def calculate_virality_for_youtube(video: Any, subscribers: int | None = None) -> float:
+def calculate_virality_for_youtube(video: Any, subscribers: int | None = None) -> ViralityResult:
     """Calculate virality score for a YouTubeVideo object."""
     return calculate_virality_score(
         views=video.views,
@@ -112,7 +143,7 @@ def calculate_virality_for_youtube(video: Any, subscribers: int | None = None) -
     )
 
 
-def calculate_virality_for_tiktok(video: Any, followers: int | None = None) -> float:
+def calculate_virality_for_tiktok(video: Any, followers: int | None = None) -> ViralityResult:
     """Calculate virality score for a TikTokVideo object."""
     return calculate_virality_score(
         views=video.views,
@@ -124,7 +155,7 @@ def calculate_virality_for_tiktok(video: Any, followers: int | None = None) -> f
     )
 
 
-def calculate_virality_for_vk(video: Any, members: int | None = None) -> float:
+def calculate_virality_for_vk(video: Any, members: int | None = None) -> ViralityResult:
     """Calculate virality score for a VKVideo or VKClip object."""
     return calculate_virality_score(
         views=video.views,
@@ -136,7 +167,7 @@ def calculate_virality_for_vk(video: Any, members: int | None = None) -> float:
     )
 
 
-def calculate_virality_for_instagram(post: Any, followers: int | None = None) -> float:
+def calculate_virality_for_instagram(post: Any, followers: int | None = None) -> ViralityResult:
     """Calculate virality score for an InstagramPost object."""
     return calculate_virality_score(
         views=post.views,

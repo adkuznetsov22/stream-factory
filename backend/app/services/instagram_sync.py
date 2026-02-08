@@ -175,7 +175,8 @@ async def sync_instagram_account(session: AsyncSession, account: SocialAccount) 
         )
         post.raw = item
         followers = profile.followers if profile else None
-        post.virality_score = calculate_virality_for_instagram(post, followers)
+        _vr = calculate_virality_for_instagram(post, followers)
+        post.virality_score = _vr.score
         session.add(post)
         synced += 1
 

@@ -192,7 +192,8 @@ async def sync_tiktok_account(session: AsyncSession, account: SocialAccount) -> 
         )
         video.raw = item
         followers = profile.followers if profile_data else None
-        video.virality_score = calculate_virality_for_tiktok(video, followers)
+        _vr = calculate_virality_for_tiktok(video, followers)
+        video.virality_score = _vr.score
         session.add(video)
         synced += 1
 

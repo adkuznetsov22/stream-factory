@@ -149,7 +149,8 @@ async def sync_youtube_account(session: AsyncSession, account: SocialAccount) ->
                     video.permalink = f"https://www.youtube.com/watch?v={item.get('video_id')}"
                     video.raw = item.get("raw")
                     video.last_synced_at = now
-                    video.virality_score = calculate_virality_for_youtube(video, details.get("subscribers"))
+                    _vr = calculate_virality_for_youtube(video, details.get("subscribers"))
+                    video.virality_score = _vr.score
                     session.add(video)
                     if video.content_type == "live":
                         synced_lives += 1

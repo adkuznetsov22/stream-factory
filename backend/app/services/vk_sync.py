@@ -118,7 +118,8 @@ async def sync_vk_account(session: AsyncSession, account: SocialAccount, limit: 
                 video.permalink = f"https://vk.com/video{data.get('owner_id') or owner_id}_{vid}"
                 video.raw = data
                 video.updated_at = datetime.now(timezone.utc)
-                video.virality_score = calculate_virality_for_vk(video, profile.members_count or profile.followers_count)
+                _vr = calculate_virality_for_vk(video, profile.members_count or profile.followers_count)
+                video.virality_score = _vr.score
                 session.add(video)
                 synced_videos += 1
             if att_type in {"clip", "short_video"}:
@@ -152,7 +153,8 @@ async def sync_vk_account(session: AsyncSession, account: SocialAccount, limit: 
                 clip.permalink = data.get("url") or data.get("player")
                 clip.raw = data
                 clip.updated_at = datetime.now(timezone.utc)
-                clip.virality_score = calculate_virality_for_vk(clip, profile.members_count or profile.followers_count)
+                _vr = calculate_virality_for_vk(clip, profile.members_count or profile.followers_count)
+                clip.virality_score = _vr.score
                 session.add(clip)
                 synced_clips += 1
 

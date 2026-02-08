@@ -17,7 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models import (
     Candidate, CandidateOrigin, CandidateStatus,
-    Project, ProjectDestination, PublishTask, Brief,
+    DecisionLog, Project, ProjectDestination, PublishTask, Brief,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,8 +224,6 @@ async def run_auto_approve(
             "title": candidate.title,
         })
 
-    await session.commit()
-
     report = {
         "project_id": project_id,
         "threshold": round(threshold, 4),
@@ -240,6 +238,21 @@ async def run_auto_approve(
         "settings": settings,
         "run_at": now.isoformat(),
     }
+
+    # Log decision
+    session.add(DecisionLog(
+        project_id=project_id,
+        payload_json={
+            "action": "auto_approve",
+            "threshold": round(threshold, 4),
+            "approved_count": len(approved),
+            "skipped_count": len(skipped),
+            "approved_ids": [a["candidate_id"] for a in approved],
+            "skipped_reasons": {s["candidate_id"]: s["reason"] for s in skipped[:20]},
+            "daily_limits": report["daily_limits"],
+        },
+    ))
+    await session.commit()
 
     logger.info(
         f"[auto_approve] Project {project_id}: "

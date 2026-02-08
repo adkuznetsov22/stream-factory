@@ -359,10 +359,12 @@ async def _upsert_candidate(
     candidate.comments = comments
     candidate.shares = shares
     candidate.subscribers = subscribers
-    candidate.virality_score = calculate_virality_score(
+    _vr = calculate_virality_score(
         views=views, likes=likes, comments=comments, shares=shares,
         published_at=published_at, subscribers=subscribers,
     )
+    candidate.virality_score = _vr.score
+    candidate.virality_factors = _vr.factors
     session.add(candidate)
     return candidate, is_new
 
