@@ -34,6 +34,7 @@ logger = logging.getLogger("scheduler")
 LOCK_TASK_GENERATION = 900_001
 LOCK_SYNC_ACCOUNTS = 900_002
 LOCK_SYNC_PUBLISHED_METRICS = 900_003
+LOCK_AGGREGATE_SNAPSHOTS = 900_004
 
 
 class SchedulerService:
@@ -114,9 +115,17 @@ class SchedulerService:
 
         self.scheduler.add_job(
             self._run_sync_published_metrics,
-            IntervalTrigger(hours=4),
+            IntervalTrigger(hours=1),
             id="sync_published_metrics",
             name="Sync published video metrics",
+            replace_existing=True,
+        )
+
+        self.scheduler.add_job(
+            self._run_aggregate_snapshots,
+            IntervalTrigger(hours=24),
+            id="aggregate_snapshots",
+            name="Aggregate old metric snapshots",
             replace_existing=True,
         )
         
@@ -231,6 +240,32 @@ class SchedulerService:
                 return result
             finally:
                 await self._release_advisory_lock(session, LOCK_SYNC_PUBLISHED_METRICS)
+
+    async def _run_aggregate_snapshots(self):
+        """Aggregate old metric snapshots (>30d → daily, >180d → weekly).
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_AGGREGATE_SNAPSHOTS)
+            if not acquired:
+                logger.debug("[aggregate_snapshots] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[aggregate_snapshots] LEADER — aggregating old snapshots")
+                from app.services.sync_published_metrics import aggregate_old_snapshots
+
+                result = await aggregate_old_snapshots(session)
+
+                logger.info(
+                    "[aggregate_snapshots] Completed: %d daily, %d weekly deleted",
+                    result.get("deleted_daily", 0),
+                    result.get("deleted_weekly", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_AGGREGATE_SNAPSHOTS)
 
     async def _sync_account(self, session: AsyncSession, account):
         """Sync a single account based on platform."""

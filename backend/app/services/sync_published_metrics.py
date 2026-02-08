@@ -4,15 +4,20 @@ Sync metrics for published videos.
 Periodically fetches views/likes/comments/shares from platform APIs
 for all recently published tasks and stores snapshots in published_video_metrics.
 
+Snapshot policy:
+  - First 48 hours after publish: snapshot every tick (scheduler runs every 1–4h)
+  - After 48 hours: snapshot once per day (skip if last_metrics_at < 24h ago)
+  - Detailed snapshots kept for 30 days, then aggregated to daily/weekly
+
 Enables analytics: candidate virality_score → actual video performance.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import PublishTask, Candidate, PublishedVideoMetrics
@@ -20,19 +25,40 @@ from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Fetch metrics for videos published within the last N days
-MAX_AGE_DAYS = 30
+# ── Snapshot policy constants ────────────────────────────────
+FRESH_WINDOW_HOURS = 48        # first 48h: snapshot every tick
+STALE_INTERVAL_HOURS = 24      # after 48h: max once per 24h
+MAX_AGE_DAYS = 90              # fetch metrics for up to 90 days
+DETAIL_RETENTION_DAYS = 30     # keep detailed snapshots 30 days
+WEEKLY_RETENTION_DAYS = 180    # keep daily aggregates 180 days, then weekly
+
+
+def _should_snapshot(task: PublishTask, now: datetime) -> bool:
+    """Determine if this task needs a new snapshot based on age policy."""
+    if not task.published_at:
+        return True
+
+    hours_since_publish = (now - task.published_at).total_seconds() / 3600
+
+    if hours_since_publish <= FRESH_WINDOW_HOURS:
+        # Fresh video: snapshot every tick
+        return True
+
+    # Stale video: check if enough time passed since last snapshot
+    if not task.last_metrics_at:
+        return True
+
+    hours_since_last = (now - task.last_metrics_at).total_seconds() / 3600
+    return hours_since_last >= STALE_INTERVAL_HOURS
 
 
 async def sync_published_metrics(session: AsyncSession) -> dict:
     """Fetch metrics for all published tasks and save snapshots.
 
+    Respects snapshot policy: frequent for fresh videos, daily for older ones.
     Returns summary dict with counts.
     """
     now = datetime.now(timezone.utc)
-
-    # Get published tasks with external_id (last MAX_AGE_DAYS)
-    from datetime import timedelta
     cutoff = now - timedelta(days=MAX_AGE_DAYS)
 
     query = (
@@ -48,11 +74,21 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
 
     if not tasks:
         logger.info("[sync_metrics] No published tasks to sync")
-        return {"synced": 0, "errors": 0, "total": 0}
+        return {"synced": 0, "skipped": 0, "errors": 0, "total": 0}
+
+    # Filter by snapshot policy
+    tasks_to_sync = [t for t in tasks if _should_snapshot(t, now)]
+    skipped = len(tasks) - len(tasks_to_sync)
+
+    if skipped:
+        logger.info(f"[sync_metrics] {skipped} tasks skipped (policy: not due yet)")
+
+    if not tasks_to_sync:
+        return {"synced": 0, "skipped": skipped, "errors": 0, "total": len(tasks)}
 
     # Group by platform
     by_platform: dict[str, list[PublishTask]] = {}
-    for task in tasks:
+    for task in tasks_to_sync:
         platform = (task.platform or "").lower()
         by_platform.setdefault(platform, []).append(task)
 
@@ -89,7 +125,7 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
                 if cand_row:
                     candidate_id = cand_row[0]
 
-                # Upsert: skip if snapshot already exists for this (platform, external_id, snapshot_at)
+                # Upsert snapshot
                 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
                 stmt = pg_insert(PublishedVideoMetrics).values(
@@ -135,8 +171,96 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
             errors += 1
             await session.rollback()
 
-    logger.info(f"[sync_metrics] Done: {synced} synced, {errors} errors, {len(tasks)} total tasks")
-    return {"synced": synced, "errors": errors, "total": len(tasks)}
+    logger.info(
+        f"[sync_metrics] Done: {synced} synced, {skipped} skipped, "
+        f"{errors} errors, {len(tasks)} total tasks"
+    )
+    return {"synced": synced, "skipped": skipped, "errors": errors, "total": len(tasks)}
+
+
+# ── Snapshot aggregation / cleanup ───────────────────────────
+
+async def aggregate_old_snapshots(session: AsyncSession) -> dict:
+    """Roll up old detailed snapshots into daily/weekly aggregates.
+
+    Policy:
+      - Snapshots older than 30 days: keep only best-per-day (max views)
+      - Snapshots older than 180 days: keep only best-per-week (max views)
+
+    Returns summary with counts of deleted rows.
+    """
+    now = datetime.now(timezone.utc)
+    detail_cutoff = now - timedelta(days=DETAIL_RETENTION_DAYS)
+    weekly_cutoff = now - timedelta(days=WEEKLY_RETENTION_DAYS)
+
+    deleted_daily = 0
+    deleted_weekly = 0
+
+    # ── Phase 1: >30 days → keep one snapshot per (task_id, day) ──
+    # Find IDs to keep: the row with max views per (task_id, date)
+    daily_keep = (
+        select(
+            func.distinct(
+                func.first_value(PublishedVideoMetrics.id).over(
+                    partition_by=[
+                        PublishedVideoMetrics.task_id,
+                        func.date_trunc("day", PublishedVideoMetrics.snapshot_at),
+                    ],
+                    order_by=PublishedVideoMetrics.views.desc().nullslast(),
+                )
+            )
+        )
+        .where(and_(
+            PublishedVideoMetrics.snapshot_at < detail_cutoff,
+            PublishedVideoMetrics.snapshot_at >= weekly_cutoff,
+        ))
+    ).scalar_subquery()
+
+    # Delete all rows in the 30–180 day window that are NOT the daily best
+    del_daily = (
+        delete(PublishedVideoMetrics)
+        .where(and_(
+            PublishedVideoMetrics.snapshot_at < detail_cutoff,
+            PublishedVideoMetrics.snapshot_at >= weekly_cutoff,
+            PublishedVideoMetrics.id.notin_(daily_keep),
+        ))
+    )
+    result_d = await session.execute(del_daily)
+    deleted_daily = result_d.rowcount
+
+    # ── Phase 2: >180 days → keep one snapshot per (task_id, week) ──
+    weekly_keep = (
+        select(
+            func.distinct(
+                func.first_value(PublishedVideoMetrics.id).over(
+                    partition_by=[
+                        PublishedVideoMetrics.task_id,
+                        func.date_trunc("week", PublishedVideoMetrics.snapshot_at),
+                    ],
+                    order_by=PublishedVideoMetrics.views.desc().nullslast(),
+                )
+            )
+        )
+        .where(PublishedVideoMetrics.snapshot_at < weekly_cutoff)
+    ).scalar_subquery()
+
+    del_weekly = (
+        delete(PublishedVideoMetrics)
+        .where(and_(
+            PublishedVideoMetrics.snapshot_at < weekly_cutoff,
+            PublishedVideoMetrics.id.notin_(weekly_keep),
+        ))
+    )
+    result_w = await session.execute(del_weekly)
+    deleted_weekly = result_w.rowcount
+
+    await session.commit()
+
+    logger.info(
+        f"[aggregate_snapshots] Cleaned up: "
+        f"{deleted_daily} daily (>30d), {deleted_weekly} weekly (>180d)"
+    )
+    return {"deleted_daily": deleted_daily, "deleted_weekly": deleted_weekly}
 
 
 # ── Platform-specific metric fetchers ────────────────────────
