@@ -288,6 +288,26 @@ def step8_mark_ready(task_id: int):
         fail(f"mark-ready-for-publish failed: {result}")
 
 
+def step8b_download(task_id: int):
+    step("8b. Download final video")
+    url = f"{BASE_URL}/api/publish-tasks/{task_id}/download"
+    req = Request(url, headers=_headers(), method="GET")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            size = len(resp.read())
+            ct = resp.headers.get("Content-Type", "")
+            cd = resp.headers.get("Content-Disposition", "")
+            if size > 0:
+                ok(f"Download OK: {size} bytes, Content-Type={ct}")
+                ok(f"Content-Disposition: {cd}")
+            else:
+                fail("Download returned empty body")
+    except HTTPError as e:
+        fail(f"Download failed: {e.code} {e.read().decode()[:200]}")
+    except URLError as e:
+        fail(f"Download failed: {e}")
+
+
 def step9_auto_publish_dry(project_id: int, task_id: int):
     step("9. Auto-publish DRY RUN (via publish-plan)")
     plan = GET(f"/api/projects/{project_id}/publish-plan")
@@ -361,6 +381,9 @@ def main():
 
         # 8. Mark ready_for_publish
         step8_mark_ready(task_id)
+
+        # 8b. Download final video
+        step8b_download(task_id)
 
         # 9. Auto-publish dry run
         step9_auto_publish_dry(project_id, task_id)
