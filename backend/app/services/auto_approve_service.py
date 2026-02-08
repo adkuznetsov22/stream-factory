@@ -232,7 +232,40 @@ async def run_auto_approve(
         .order_by(Candidate.virality_score.desc())
         .limit(MAX_CANDIDATES_PER_RUN)
     )
-    candidates = candidates_q.scalars().all()
+    candidates_raw = list(candidates_q.scalars().all())
+
+    # ── Smart ordering via selector ───────────────────────────
+    from app.services.selector import SelectionState, rank_candidates, top_debug
+
+    # Build state from today's approved candidates
+    sel_state = SelectionState()
+    if diversity_enabled and (topic_today or author_today):
+        # Last approved = the most recent by reviewed_at among today's
+        last_approved_q = await session.execute(
+            select(Candidate.meta, Candidate.author, Candidate.url, Candidate.origin, Candidate.brief_id)
+            .where(and_(
+                Candidate.project_id == project_id,
+                Candidate.status.in_([CandidateStatus.approved.value, "used"]),
+                Candidate.reviewed_at >= day_start,
+            ))
+            .order_by(Candidate.reviewed_at.desc())
+            .limit(1)
+        )
+        last_row = last_approved_q.first()
+        if last_row:
+            lmeta, lauthor, lurl, lorigin, lbrief = last_row
+            lmeta = lmeta or {}
+            sel_state.last_topic_signature = lmeta.get("topic_signature", "")
+            if lorigin == CandidateOrigin.generate.value:
+                sel_state.last_author_key = f"brief:{lbrief}" if lbrief else ""
+            else:
+                sel_state.last_author_key = lauthor or lurl or ""
+        sel_state.recent_topic_signatures = set(topic_today.keys())
+        sel_state.recent_author_keys = set(author_today.keys())
+
+    ranked = rank_candidates(candidates_raw, sel_state)
+    candidates = [si.item for si in ranked]
+    ranking_debug = top_debug(ranked, 5)
 
     approved: list[dict] = []
     skipped: list[dict] = []
@@ -439,6 +472,8 @@ async def run_auto_approve(
         "approved": approved,
         "skipped": skipped,
         "skipped_reasons_breakdown": reasons_breakdown,
+        "ordered_by": "effective_score",
+        "ranking_debug": ranking_debug,
         "daily_limits": {
             dest.id: {"platform": dest.platform, "used": daily_counts.get(dest.id, 0), "limit": daily_limit}
             for dest in active_dests

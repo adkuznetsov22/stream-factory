@@ -161,35 +161,59 @@ async def run_auto_publish(
         tg_last_n = ps.get("topic_guard_last_n", 5)
         tg_cooldown_hours = ps.get("topic_guard_cooldown_hours", 12)
 
-        # Build banned topic_signature sets per destination
+        # Build banned topic_signature sets + SelectionState per destination
+        from app.services.selector import SelectionState, rank_tasks, top_debug
+
         banned_topic_sigs: dict[int, set[str]] = {}
-        if tg_enabled:
-            tg_cutoff = now - timedelta(hours=tg_cooldown_hours)
-            for dest in active_dests:
-                dest_id = dest.social_account_id
-                # Recent published tasks for this destination
-                recent_q = await session.execute(
-                    select(PublishTask.id).where(and_(
-                        PublishTask.project_id == project.id,
-                        PublishTask.destination_social_account_id == dest_id,
-                        PublishTask.status == "published",
-                        PublishTask.published_at >= tg_cutoff,
-                    )).order_by(PublishTask.published_at.desc()).limit(tg_last_n)
-                )
-                recent_task_ids = [r[0] for r in recent_q.all()]
-                sigs: set[str] = set()
-                if recent_task_ids:
-                    cand_sigs_q = await session.execute(
-                        select(Candidate.meta).where(
-                            Candidate.linked_publish_task_id.in_(recent_task_ids),
-                        )
+        dest_states: dict[int, SelectionState] = {}
+        tg_cutoff = now - timedelta(hours=tg_cooldown_hours) if tg_enabled else now
+
+        for dest in active_dests:
+            dest_id = dest.social_account_id
+            state = SelectionState()
+
+            # Recent published tasks for this destination (ordered newest first)
+            recent_q = await session.execute(
+                select(PublishTask.id).where(and_(
+                    PublishTask.project_id == project.id,
+                    PublishTask.destination_social_account_id == dest_id,
+                    PublishTask.status == "published",
+                    PublishTask.published_at >= tg_cutoff,
+                )).order_by(PublishTask.published_at.desc()).limit(tg_last_n)
+            )
+            recent_task_ids = [r[0] for r in recent_q.all()]
+            sigs: set[str] = set()
+            recent_authors: set[str] = set()
+            if recent_task_ids:
+                cand_hist_q = await session.execute(
+                    select(Candidate.meta, Candidate.author, Candidate.url, Candidate.origin, Candidate.brief_id,
+                           Candidate.linked_publish_task_id).where(
+                        Candidate.linked_publish_task_id.in_(recent_task_ids),
                     )
-                    for (cmeta,) in cand_sigs_q.all():
-                        if cmeta and isinstance(cmeta, dict):
-                            ts = cmeta.get("topic_signature")
-                            if ts:
-                                sigs.add(ts)
-                banned_topic_sigs[dest_id] = sigs
+                )
+                first = True
+                for cmeta, cauthor, curl, corigin, cbrief, ctask_id in cand_hist_q.all():
+                    cmeta = cmeta or {}
+                    ts = cmeta.get("topic_signature", "")
+                    if ts:
+                        sigs.add(ts)
+                    # Author key
+                    if corigin == "GENERATE":
+                        ak = f"brief:{cbrief}" if cbrief else ""
+                    else:
+                        ak = cauthor or curl or ""
+                    if ak:
+                        recent_authors.add(ak)
+                    # First row = most recent (last published)
+                    if first and ctask_id == recent_task_ids[0]:
+                        state.last_topic_signature = ts
+                        state.last_author_key = ak
+                        first = False
+
+            banned_topic_sigs[dest_id] = sigs
+            state.recent_topic_signatures = sigs
+            state.recent_author_keys = recent_authors
+            dest_states[dest_id] = state
 
         # Count published today per destination
         daily_counts: dict[int, int] = {}
@@ -225,45 +249,50 @@ async def run_auto_publish(
         )
         eligible_tasks = list(eligible_q.scalars().all())
 
-        # Enrich with virality score for sorting
+        # Enrich with virality score + candidate data for selector
         task_ids = [t.id for t in eligible_tasks]
         score_map: dict[int, float] = {}
+        candidate_map: dict[int, Candidate] = {}
         if task_ids:
             cand_q = await session.execute(
-                select(Candidate.linked_publish_task_id, Candidate.virality_score)
+                select(Candidate)
                 .where(
                     Candidate.linked_publish_task_id.in_(task_ids),
-                    Candidate.virality_score.isnot(None),
                 )
             )
-            score_map = {r[0]: r[1] for r in cand_q.all()}
+            for cand in cand_q.scalars().all():
+                if cand.linked_publish_task_id:
+                    candidate_map[cand.linked_publish_task_id] = cand
+                    if cand.virality_score is not None:
+                        score_map[cand.linked_publish_task_id] = cand.virality_score
 
-        eligible_tasks.sort(
-            key=lambda t: (-(score_map.get(t.id) or 0), t.created_at or now)
-        )
+        # Smart ordering via selector — group by destination
+        # Use first active dest's state as default (tasks are per-dest anyway)
+        default_dest_id = active_dests[0].social_account_id if active_dests else 0
+        # Pre-filter tasks that have video and are not already published
+        valid_tasks = []
+        for t in eligible_tasks:
+            artifacts = t.artifacts or {}
+            video_path = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
+            if not video_path:
+                skipped.append({"project_id": project.id, "task_id": t.id, "reason": "no_video"})
+                continue
+            if t.published_url or t.published_external_id:
+                skipped.append({"project_id": project.id, "task_id": t.id, "reason": "already_published"})
+                continue
+            valid_tasks.append(t)
+
+        # Rank valid tasks using selector per destination
+        dest_id_for_ranking = valid_tasks[0].destination_social_account_id if valid_tasks else default_dest_id
+        sel_state = dest_states.get(dest_id_for_ranking, SelectionState())
+        ranked = rank_tasks(valid_tasks, score_map, candidate_map, sel_state)
+        eligible_tasks = [si.item for si in ranked]
+
+        # Debug: top-5 effective scores
+        ranking_debug = top_debug(ranked, 5)
 
         for task in eligible_tasks:
             dest_id = task.destination_social_account_id
-
-            # Check video exists
-            artifacts = task.artifacts or {}
-            video_path = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
-            if not video_path:
-                skipped.append({
-                    "project_id": project.id,
-                    "task_id": task.id,
-                    "reason": "no_video",
-                })
-                continue
-
-            # Already published guard
-            if task.published_url or task.published_external_id:
-                skipped.append({
-                    "project_id": project.id,
-                    "task_id": task.id,
-                    "reason": "already_published",
-                })
-                continue
 
             # Daily limit
             if daily_counts.get(dest_id, 0) >= daily_limit:
@@ -346,6 +375,7 @@ async def run_auto_publish(
         "skipped_count": len(skipped),
         "started": started,
         "skipped": skipped,
+        "ordered_by": "effective_score",
         "dry_run": dry_run,
         "run_at": now.isoformat(),
     }
