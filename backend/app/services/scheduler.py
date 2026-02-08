@@ -39,6 +39,7 @@ LOCK_CALIBRATE_SCORING = 900_005
 LOCK_AUTO_APPROVE = 900_006
 LOCK_AUTO_PROCESS = 900_007
 LOCK_AUTO_PUBLISH = 900_008
+LOCK_AUTO_GENERATE = 900_009
 
 
 class SchedulerService:
@@ -166,6 +167,15 @@ class SchedulerService:
             IntervalTrigger(minutes=2),
             id="auto_publish",
             name="Auto-publish ready tasks",
+            replace_existing=True,
+        )
+
+        # Auto-generate: create GENERATE candidates from briefs
+        self.scheduler.add_job(
+            self._run_auto_generate,
+            IntervalTrigger(hours=6),
+            id="auto_generate",
+            name="Auto-generate candidates from briefs",
             replace_existing=True,
         )
         
@@ -384,6 +394,32 @@ class SchedulerService:
                 return result
             finally:
                 await self._release_advisory_lock(session, LOCK_AUTO_PUBLISH)
+
+    async def _run_auto_generate(self):
+        """Auto-generate candidates from briefs (every 6h).
+
+        Protected by advisory lock — only one instance executes per tick.
+        """
+        async with await self._get_session() as session:
+            acquired = await self._try_advisory_lock(session, LOCK_AUTO_GENERATE)
+            if not acquired:
+                logger.debug("[auto_generate] Advisory lock not acquired — skipping tick")
+                return None
+
+            try:
+                logger.info("[auto_generate] LEADER — running auto-generate")
+                from app.services.auto_generate_service import run_auto_generate_all
+
+                result = await run_auto_generate_all(session)
+
+                logger.info(
+                    "[auto_generate] Completed: %d projects, %d total created",
+                    result.get("processed", 0),
+                    result.get("total_created", 0),
+                )
+                return result
+            finally:
+                await self._release_advisory_lock(session, LOCK_AUTO_GENERATE)
 
     async def _run_auto_process(self):
         """Auto-process queued tasks with concurrency limits.

@@ -2075,6 +2075,22 @@ async def trigger_auto_process(
     return await run_auto_process(session, dry_run=dry_run)
 
 
+@router.post("/projects/{project_id}/auto-generate", response_model=dict)
+async def trigger_auto_generate(
+    project_id: int,
+    dry_run: bool = Query(default=False),
+    session: AsyncSession = SessionDep,
+):
+    """Manually trigger auto-generate for a project.
+
+    Creates GENERATE candidates from active briefs, respecting
+    daily limits and cooldowns.
+    Pass ?dry_run=true to preview without writing to DB.
+    """
+    from app.services.auto_generate_service import run_auto_generate
+    return await run_auto_generate(session, project_id, dry_run=dry_run)
+
+
 @router.post("/scheduler/auto-publish", response_model=dict)
 async def trigger_auto_publish(
     dry_run: bool = Query(default=False),

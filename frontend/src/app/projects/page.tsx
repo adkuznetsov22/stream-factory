@@ -388,6 +388,168 @@ function PublishScheduleBlock({
   );
 }
 
+type ContentPlan = {
+  auto_generate_enabled?: boolean;
+  generate_per_day?: number;
+  cooldown_hours_per_brief?: number;
+  brief_weights?: Record<string, number>;
+  min_gap_minutes?: number;
+  default_weight?: number;
+};
+
+type AutoGenerateReport = {
+  created_count: number;
+  skipped_count: number;
+  created: { brief_id: number; brief_title: string; weight: number; virtual_score: number; candidate_id?: number | null; dry_run?: boolean }[];
+  skipped: { brief_id?: number; reason: string }[];
+  today_total: number;
+  limit: number;
+  active_briefs: number;
+  dry_run: boolean;
+  run_at?: string;
+};
+
+type BriefItem = { id: number; title: string; status: string; target_platform?: string };
+
+function ContentPlanBlock({
+  project, briefs, onUpdate, report, running, onRunNow,
+}: {
+  project: Project;
+  briefs: BriefItem[];
+  onUpdate: (meta: Record<string, unknown>) => void;
+  report: AutoGenerateReport | null;
+  running: boolean;
+  onRunNow: (dryRun: boolean) => void;
+}) {
+  const meta = (project.meta || {}) as Record<string, unknown>;
+  const cp = (meta.content_plan || {}) as ContentPlan;
+  const enabled = cp.auto_generate_enabled ?? false;
+  const perDay = cp.generate_per_day ?? 3;
+  const cooldown = cp.cooldown_hours_per_brief ?? 24;
+  const defaultWeight = cp.default_weight ?? 1.0;
+  const weights = cp.brief_weights ?? {};
+  const activeBriefs = briefs.filter(b => b.status === "active");
+
+  const set = (patch: Partial<ContentPlan>) => {
+    const newCp = { ...cp, ...patch };
+    onUpdate({ ...meta, content_plan: newCp });
+  };
+
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <span style={{ fontWeight: 600, fontSize: 14, display: "block", marginBottom: 12 }}>Content Plan / Auto-Generate</span>
+      <div style={{
+        background: enabled ? "#f59e0b08" : "var(--bg-muted)",
+        border: `1px solid ${enabled ? "#f59e0b40" : "var(--border)"}`,
+        borderRadius: 10, padding: 16,
+      }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", marginBottom: 12 }}>
+          <input type="checkbox" checked={enabled} onChange={e => set({ auto_generate_enabled: e.target.checked })} />
+          <span style={{ fontSize: 13, fontWeight: 500 }}>Авто-генерация кандидатов из Briefs</span>
+        </label>
+
+        {enabled && (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Генераций / день</label>
+                <input type="number" min={1} max={20} value={perDay}
+                  onChange={e => set({ generate_per_day: Number(e.target.value) || 3 })}
+                  style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Cooldown brief (ч)</label>
+                <input type="number" min={0} max={168} value={cooldown}
+                  onChange={e => set({ cooldown_hours_per_brief: Number(e.target.value) || 24 })}
+                  style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>Вес по умолч.</label>
+                <input type="number" min={0.1} max={10} step={0.1} value={defaultWeight}
+                  onChange={e => set({ default_weight: Number(e.target.value) || 1.0 })}
+                  style={{ width: "100%" }} />
+              </div>
+            </div>
+
+            {/* Brief weights */}
+            {activeBriefs.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 6 }}>Веса briefs (активные)</label>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 80px", gap: 4, fontSize: 12 }}>
+                  {activeBriefs.map(b => (
+                    <div key={b.id} style={{ display: "contents" }}>
+                      <span style={{ padding: "4px 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        #{b.id} {b.title}
+                      </span>
+                      <input type="number" min={0.1} max={10} step={0.1}
+                        value={weights[String(b.id)] ?? defaultWeight}
+                        onChange={e => set({ brief_weights: { ...weights, [String(b.id)]: Number(e.target.value) || 1.0 } })}
+                        style={{ width: "100%" }} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {activeBriefs.length === 0 && (
+              <div style={{ fontSize: 12, color: "var(--fg-subtle)", marginBottom: 12 }}>
+                Нет активных briefs. Создайте brief и переведите в статус «active».
+              </div>
+            )}
+
+            {/* Run buttons */}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => onRunNow(false)} disabled={running}
+                style={{ padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  background: running ? "var(--bg-muted)" : "#f59e0b20", color: running ? "var(--fg-subtle)" : "#f59e0b", border: "1px solid #f59e0b40" }}>
+                {running ? "Генерация..." : "▶ Сгенерировать"}
+              </button>
+              <button onClick={() => onRunNow(true)} disabled={running}
+                style={{ padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  background: running ? "var(--bg-muted)" : "#dbeafe", color: running ? "var(--fg-subtle)" : "#2563eb", border: "1px solid #93c5fd" }}>
+                Dry Run
+              </button>
+            </div>
+
+            {/* Report */}
+            {report && (
+              <div style={{ marginTop: 12, padding: 12, background: "var(--bg-subtle)", borderRadius: 8, border: "1px solid var(--border)" }}>
+                <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12, alignItems: "center" }}>
+                  {report.dry_run && <span style={{ background: "#dbeafe", color: "#2563eb", padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 600 }}>DRY RUN</span>}
+                  <span style={{ color: "#22c55e" }}>Создано: <strong>{report.created_count}</strong></span>
+                  <span style={{ color: "#ef4444" }}>Пропущено: <strong>{report.skipped_count}</strong></span>
+                  <span style={{ color: "var(--fg-subtle)" }}>Сегодня: {report.today_total}/{report.limit}</span>
+                </div>
+                {report.created.length > 0 && (
+                  <div style={{ fontSize: 11, marginBottom: 6 }}>
+                    {report.created.map((c, i) => (
+                      <div key={i} style={{ display: "flex", gap: 8, padding: "2px 0" }}>
+                        <span style={{ color: "#22c55e" }}>✓</span>
+                        <span>{c.brief_title}</span>
+                        <span style={{ color: "var(--fg-subtle)" }}>w={c.weight} score={c.virtual_score?.toFixed(2)}</span>
+                        {c.candidate_id && <span style={{ color: "var(--fg-subtle)" }}>→ #{c.candidate_id}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {report.skipped.length > 0 && (
+                  <div style={{ fontSize: 11 }}>
+                    {report.skipped.map((s, i) => (
+                      <div key={i} style={{ color: "var(--fg-subtle)", padding: "2px 0" }}>
+                        ✕ {s.reason}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -403,6 +565,9 @@ export default function ProjectsPage() {
   const [aaRunning, setAaRunning] = useState(false);
   const [apReport, setApReport] = useState<AutoPublishReport | null>(null);
   const [apRunning, setApRunning] = useState(false);
+  const [agReport, setAgReport] = useState<AutoGenerateReport | null>(null);
+  const [agRunning, setAgRunning] = useState(false);
+  const [briefs, setBriefs] = useState<BriefItem[]>([]);
 
   const load = async () => {
     setLoading(true);
@@ -422,12 +587,14 @@ export default function ProjectsPage() {
   useEffect(() => { load(); }, []);
 
   const loadDetails = async (id: number) => {
-    const [sRes, dRes] = await Promise.all([
+    const [sRes, dRes, bRes] = await Promise.all([
       fetch(`/api/projects/${id}/sources`),
       fetch(`/api/projects/${id}/destinations`),
+      fetch(`/api/projects/${id}/briefs`),
     ]);
     if (sRes.ok) setSources(await sRes.json());
     if (dRes.ok) setDestinations(await dRes.json());
+    if (bRes.ok) setBriefs(await bRes.json());
   };
 
   const toggleExpand = (id: number) => {
@@ -697,6 +864,24 @@ export default function ProjectsPage() {
                         const res = await fetch(`/api/scheduler/auto-publish${qs}`, { method: "POST" });
                         if (res.ok) setApReport(await res.json());
                         setApRunning(false);
+                        if (!dryRun) load();
+                      }}
+                    />
+
+                    {/* Content Plan / Auto-Generate */}
+                    <ContentPlanBlock
+                      project={p}
+                      briefs={expanded === p.id ? briefs : []}
+                      onUpdate={(newMeta) => updateProject(p.id, { meta: newMeta } as any)}
+                      report={expanded === p.id ? agReport : null}
+                      running={agRunning}
+                      onRunNow={async (dryRun: boolean) => {
+                        setAgRunning(true);
+                        setAgReport(null);
+                        const qs = dryRun ? "?dry_run=true" : "";
+                        const res = await fetch(`/api/projects/${p.id}/auto-generate${qs}`, { method: "POST" });
+                        if (res.ok) setAgReport(await res.json());
+                        setAgRunning(false);
                         if (!dryRun) load();
                       }}
                     />
