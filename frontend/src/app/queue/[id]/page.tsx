@@ -349,13 +349,21 @@ export default function TaskDetailPage() {
     await loadLog(tailSize);
   };
 
-  const handleRetryPublish = async () => {
+  const handleRetryPublish = async (force = false) => {
     if (!taskId) return;
     setActionError(null);
-    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/retry-publish`, { method: "POST" });
+    const qs = force ? "?force=true" : "";
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/retry-publish${qs}`, { method: "POST" });
+    if (res.status === 409) {
+      // Already published — ask user to confirm force
+      if (confirm("Задача уже опубликована. Переопубликовать принудительно (force)?")) {
+        return handleRetryPublish(true);
+      }
+      return;
+    }
     if (!res.ok) {
       const text = await res.text();
-      setActionError(`Не удалось опубликовать: ${text}`);
+      setActionError(`Retry publish: ${text}`);
       return;
     }
     await fetchData();
@@ -400,7 +408,7 @@ export default function TaskDetailPage() {
               </button>
               <button
                 style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#0ea5e9", color: "#fff", fontWeight: 600, cursor: "pointer", opacity: data?.actions?.can_retry_publish ? 1 : 0.4 }}
-                onClick={handleRetryPublish}
+                onClick={() => handleRetryPublish()}
                 disabled={!(data?.actions?.can_retry_publish ?? false)}
               >
                 Retry Publish

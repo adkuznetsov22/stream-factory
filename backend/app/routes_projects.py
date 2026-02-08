@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, List
+
+logger = logging.getLogger(__name__)
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -1677,36 +1680,184 @@ async def publish_task(task_id: int, session: AsyncSession = SessionDep):
 
 
 @router.post("/publish-tasks/{task_id}/retry-publish", response_model=dict)
-async def retry_publish_task(task_id: int, session: AsyncSession = SessionDep):
+async def retry_publish_task(
+    task_id: int,
+    force: bool = Query(default=False),
+    session: AsyncSession = SessionDep,
+):
     """
-    Retry only the publish step (P01_PUBLISH) for a task.
+    Retry only the publish step (P01_PUBLISH) for a task via PipelineExecutor.
 
-    Checks that ready.mp4 or final.mp4 exists, clears any previous
-    publish error, and runs only the publish handler.
+    Creates a proper StepResult in DB, same as a full pipeline run.
+    If task is already published and force=false → 409.
+    If force=true → clears previous publish state and re-publishes.
     """
+    from pathlib import Path
+    from app.services.pipeline_executor import StepContext, PipelineExecutor
+    from app.models import StepResult, ExportProfile
+
     task = await session.get(PublishTask, task_id)
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
+    # ── Check video exists ────────────────────────────────────
     artifacts = task.artifacts or {}
-    video_path = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
-    if not video_path:
+    video_path_str = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
+    if not video_path_str:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No ready or final video found — run full pipeline first",
         )
 
-    # Clear previous publish state
-    task.publish_error = None
-    task.published_url = None
-    task.published_external_id = None
-    task.published_at = None
+    # ── Already published guard ───────────────────────────────
+    already_published = (
+        task.status == "published"
+        and (task.published_url or task.published_external_id)
+    )
+    if already_published and not force:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Task already published. Pass ?force=true to re-publish.",
+        )
+
+    # ── Clear previous publish state when force or retrying ───
+    if already_published or task.publish_error:
+        task.publish_error = None
+        task.published_url = None
+        task.published_external_id = None
+        task.published_at = None
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+    # ── Load project for policy / export_profile ──────────────
+    project = await session.scalar(
+        select(Project).where(Project.id == task.project_id)
+    )
+
+    # ── Build StepContext (same as task_processor) ────────────
+    data_dir = Path(os.getenv("DATA_DIR", "/data"))
+    task_dir = data_dir / "tasks" / str(task.id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    log_lines: list[str] = []
+    def log_cb(msg: str):
+        log_lines.append(msg)
+        logger.info(f"[retry-publish][task={task_id}] {msg}")
+
+    ctx = StepContext(task_id=task_id, task_dir=task_dir, log_cb=log_cb)
+    ctx.session = session
+    ctx.publish_task = task
+    ctx.platform = task.platform
+    ctx.destination_account_id = task.destination_social_account_id
+    ctx.caption_text = task.caption_text or task.instructions
+
+    # Set current_video so P01_PUBLISH finds the file
+    for name in ("final.mp4", "ready.mp4", "output.mp4"):
+        p = task_dir / name
+        if p.exists():
+            ctx.set_output_video(p)
+            break
+
+    # Populate GENERATE context
+    if task.artifacts and isinstance(task.artifacts, dict) and task.artifacts.get("origin") == "GENERATE":
+        ctx.candidate_meta = task.artifacts.get("candidate_meta", {})
+        ctx.brief_data = task.artifacts.get("brief", {})
+
+    # Populate policy
+    if project and project.policy and isinstance(project.policy, dict):
+        ctx.policy = project.policy
+
+    # Populate export profile
+    if project and project.export_profile_id:
+        ep = await session.get(ExportProfile, project.export_profile_id)
+        if ep:
+            ctx.export_profile = {
+                "name": ep.name, "target_platform": ep.target_platform,
+                "max_duration_sec": ep.max_duration_sec,
+                "width": ep.width, "height": ep.height, "fps": ep.fps,
+                "codec": ep.codec, "video_bitrate": ep.video_bitrate,
+                "audio_bitrate": ep.audio_bitrate,
+            }
+
+    # ── Execute P01_PUBLISH via PipelineExecutor ──────────────
+    executor = PipelineExecutor(ctx)
+    step_def = {
+        "id": "retry_publish",
+        "tool_id": "P01_PUBLISH",
+        "name": "Publish (retry)",
+        "enabled": True,
+        "params": {},
+    }
+
+    pipeline_result = await executor.execute_steps([step_def])
+
+    # ── Persist StepResult in DB ──────────────────────────────
+    from datetime import datetime as dt, timezone as tz
+    now = dt.now(tz.utc)
+
+    # Determine next step_index for this task
+    max_idx_q = await session.execute(
+        select(func.max(StepResult.step_index)).where(StepResult.task_id == task_id)
+    )
+    max_idx = max_idx_q.scalar() or 0
+
+    step_output = {}
+    step_error = None
+    step_status = "completed"
+    duration_ms = None
+
+    if pipeline_result["steps"]:
+        s = pipeline_result["steps"][0]
+        step_output = s.get("outputs", {})
+        step_error = s.get("error")
+        step_status = "completed" if s.get("status") == "ok" else "error"
+        duration_ms = s.get("duration_ms")
+    elif pipeline_result.get("error"):
+        step_error = pipeline_result["error"]
+        step_status = "error"
+
+    sr = StepResult(
+        task_id=task_id,
+        step_index=max_idx + 1,
+        tool_id="P01_PUBLISH",
+        step_name="Publish (retry)",
+        status=step_status,
+        started_at=now,
+        completed_at=dt.now(tz.utc),
+        duration_ms=duration_ms,
+        output_data=step_output,
+        error_message=step_error,
+        logs="\n".join(log_lines) if log_lines else None,
+        moderation_status="auto",
+        can_retry=True,
+        retry_count=0,
+        version=1,
+    )
+    session.add(sr)
+
+    # Update dag_debug to include this step
+    existing_debug = task.dag_debug or {}
+    existing_steps = existing_debug.get("steps", [])
+    existing_steps.extend(executor.get_debug_info().get("steps", []))
+    task.dag_debug = {"steps": existing_steps}
     session.add(task)
     await session.commit()
 
-    from app.services.auto_publisher import auto_publisher
-    result = await auto_publisher.publish_task(session, task_id)
-    return result
+    # ── Build response ────────────────────────────────────────
+    await session.refresh(task)
+
+    return {
+        "task_id": task_id,
+        "status": task.status,
+        "success": pipeline_result.get("success", False),
+        "published_url": task.published_url,
+        "published_external_id": task.published_external_id,
+        "publish_error": task.publish_error,
+        "step_result_id": sr.id,
+        "attempts": step_output.get("attempts", []),
+        "logs": log_lines,
+    }
 
 
 @router.get("/publish-tasks/{task_id}/metrics", response_model=list[dict])
