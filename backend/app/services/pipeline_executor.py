@@ -488,38 +488,65 @@ async def handle_watermark_old(ctx: StepContext, params: dict) -> dict:
 
 @PipelineExecutor.register("T14_BURN_CAPTIONS")
 async def handle_burn_captions(ctx: StepContext, params: dict) -> dict:
-    """Burn captions/subtitles into video. Respects export_profile safe_area."""
+    """Burn captions/subtitles into video.
+
+    Параметры (params → export_profile.safe_area → дефолт):
+        bottom_margin  – отступ снизу в px (safe_area.bottom)
+        top_margin     – отступ сверху в px (safe_area.top)
+        font_size      – размер шрифта (36)
+        max_lines      – макс. строк на экране (2)
+        line_spacing    – межстрочный интервал в px (8)
+        outline        – толщина обводки (2)
+    """
     input_path = ctx.get_input_video()
     output_path = ctx.final_path
-    
+
     ep = ctx.export_profile
     safe = ep.get("safe_area", {})
-    
+
     text = ctx.caption_text or params.get("text", "")
-    fontsize = params.get("fontsize", 36)
+
+    # ── Параметры с каскадом: params → safe_area → дефолт ──
+    bottom_margin = params.get("bottom_margin") or safe.get("bottom") or 50
+    top_margin = params.get("top_margin") or safe.get("top") or 120
+    margin_l = params.get("margin_l") or safe.get("left") or 30
+    margin_r = params.get("margin_r") or safe.get("right") or 30
+    font_size = params.get("font_size") or params.get("fontsize") or 36
+    max_lines = params.get("max_lines", 2)
+    line_spacing = params.get("line_spacing", 8)
     outline = params.get("outline", 2)
-    
-    # Вычисляем MarginV из safe_area.bottom чтобы субтитры не попадали в зону кнопок
-    margin_v = safe.get("bottom", 50) if safe else params.get("margin_v", 50)
-    margin_l = safe.get("left", 30) if safe else params.get("margin_l", 30)
-    margin_r = safe.get("right", 30) if safe else params.get("margin_r", 30)
-    
+
     if not text:
         ctx.log("No caption text, skipping burn")
         return {"skipped": True}
-    
-    # Create simple SRT file
-    srt_content = f"1\n00:00:00,000 --> 00:00:05,000\n{text}\n"
-    ctx.captions_path.write_text(srt_content, encoding="utf-8")
-    
-    vf = (
-        f"subtitles={ctx.captions_path}:force_style='"
-        f"FontSize={fontsize},Outline={outline},"
-        f"MarginV={margin_v},MarginL={margin_l},MarginR={margin_r}'"
-    )
-    
+
+    # Если есть готовый SRT/ASS — используем его, иначе создаём простой
+    captions_file = ctx.captions_path
+    existing_captions = ctx.outputs.get("captions_path")
+    if existing_captions and Path(existing_captions).exists():
+        captions_file = Path(existing_captions)
+    else:
+        srt_content = f"1\n00:00:00,000 --> 00:00:05,000\n{text}\n"
+        captions_file.write_text(srt_content, encoding="utf-8")
+
+    # force_style для ASS/SRT рендера через libass
+    style_parts = [
+        f"FontSize={font_size}",
+        f"Outline={outline}",
+        f"MarginV={bottom_margin}",
+        f"MarginL={margin_l}",
+        f"MarginR={margin_r}",
+        f"Spacing={line_spacing}",
+    ]
+    # WrapStyle=0 — автоперенос по словам с учётом max_lines
+    # Alignment=2 — центр-низ
+    style_parts.append("WrapStyle=0")
+    style_parts.append("Alignment=2")
+
+    vf = f"subtitles={captions_file}:force_style='{','.join(style_parts)}'"
+
     audio_bitrate = ep.get("audio_bitrate") or "128k"
-    
+
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
@@ -533,11 +560,24 @@ async def handle_burn_captions(ctx: StepContext, params: dict) -> dict:
         "-b:a", audio_bitrate,
         str(output_path),
     ]
-    
+
     await run_cmd(cmd, ctx.log)
     ctx.set_output_video(output_path)
-    
-    return {"path": str(output_path), "captions_path": str(ctx.captions_path)}
+
+    ctx.log(
+        f"[T14_BURN_CAPTIONS] font_size={font_size}, bottom_margin={bottom_margin}, "
+        f"top_margin={top_margin}, max_lines={max_lines}, line_spacing={line_spacing}"
+    )
+
+    return {
+        "path": str(output_path),
+        "captions_path": str(captions_file),
+        "font_size": font_size,
+        "bottom_margin": bottom_margin,
+        "top_margin": top_margin,
+        "max_lines": max_lines,
+        "line_spacing": line_spacing,
+    }
 
 
 @PipelineExecutor.register("T20_SPEED")
@@ -1456,8 +1496,13 @@ def _build_ass_file(
     outline: int,
     position: str,
     style: str,
+    *,
+    margin_v: int = 50,
+    margin_l: int = 50,
+    margin_r: int = 50,
+    spacing: int = 0,
 ) -> str:
-    """Build ASS subtitle file."""
+    """Build ASS subtitle file with configurable margins and spacing."""
     # Alignment: 1=left, 2=center, 3=right; +0=bottom, +4=middle, +8=top
     alignment = {"bottom": 2, "top": 8, "center": 5}.get(position, 2)
     
@@ -1480,7 +1525,7 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{font_size},{style_params['primary']},&H000000FF,{style_params['outline_color']},&H80000000,{style_params['bold']},0,0,0,100,100,0,0,1,{outline},1,{alignment},50,50,50,1
+Style: Default,{font},{font_size},{style_params['primary']},&H000000FF,{style_params['outline_color']},&H80000000,{style_params['bold']},0,0,0,100,100,{spacing},0,1,{outline},1,{alignment},{margin_l},{margin_r},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1616,14 +1661,30 @@ async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
 
 @PipelineExecutor.register("G02_CAPTIONS")
 async def handle_generate_captions(ctx: StepContext, params: dict) -> dict:
-    """Generate SRT captions from script segments.
+    """Generate SRT/ASS captions from script segments.
 
-    Uses the script produced by G01_SCRIPT (or candidate_meta) to build
-    timed SRT/ASS subtitle files without requiring Whisper.
+    Параметры (params → export_profile.safe_area → дефолт):
+        bottom_margin  – отступ снизу в px (safe_area.bottom, 50)
+        top_margin     – отступ сверху в px (safe_area.top, 120)
+        font_size      – размер шрифта для ASS (48)
+        max_lines      – макс. строк на экране (2)
+        line_spacing    – межстрочный интервал для ASS (8)
+        max_chars_per_line – макс. символов в строке для переноса (42)
     """
     script_data = ctx.outputs.get("script_data") or {}
     segments = script_data.get("segments", [])
     meta = ctx.candidate_meta or {}
+
+    ep = ctx.export_profile
+    safe = ep.get("safe_area", {})
+
+    # ── Параметры с каскадом: params → safe_area → дефолт ──
+    bottom_margin = params.get("bottom_margin") or safe.get("bottom") or 50
+    top_margin = params.get("top_margin") or safe.get("top") or 120
+    font_size = params.get("font_size", 48)
+    max_lines = params.get("max_lines", 2)
+    line_spacing = params.get("line_spacing", 8)
+    max_chars = params.get("max_chars_per_line", 42)
 
     # Fallback: build segments from meta captions_draft
     if not segments:
@@ -1647,10 +1708,9 @@ async def handle_generate_captions(ctx: StepContext, params: dict) -> dict:
         return {"skipped": True, "reason": "no segments"}
 
     fmt = params.get("format", "srt")
-    max_chars = params.get("max_chars_per_line", 42)
 
-    # Word-wrap long lines
-    def wrap(text: str, limit: int) -> str:
+    # Word-wrap с учётом max_lines
+    def wrap(text: str, limit: int, max_ln: int) -> str:
         words = text.split()
         lines: list[str] = []
         current = ""
@@ -1662,6 +1722,10 @@ async def handle_generate_captions(ctx: StepContext, params: dict) -> dict:
                 current = f"{current} {w}".strip()
         if current:
             lines.append(current)
+        # Ограничение по max_lines
+        if len(lines) > max_ln:
+            lines = lines[:max_ln]
+            lines[-1] = lines[-1][:limit - 1] + "…"
         return "\n".join(lines)
 
     # Build SRT
@@ -1669,7 +1733,7 @@ async def handle_generate_captions(ctx: StepContext, params: dict) -> dict:
     for i, seg in enumerate(segments, 1):
         start = _format_srt_time(seg.get("start_sec", 0))
         end = _format_srt_time(seg.get("end_sec", 0))
-        text = wrap(seg.get("text", ""), max_chars)
+        text = wrap(seg.get("text", ""), max_chars, max_lines)
         srt_lines.append(f"{i}\n{start} --> {end}\n{text}\n")
 
     srt_content = "\n".join(srt_lines)
@@ -1680,14 +1744,24 @@ async def handle_generate_captions(ctx: StepContext, params: dict) -> dict:
     ctx.outputs["captions_segments"] = segments
     ctx.captions_path = srt_path
 
+    # Сохраняем caption-параметры в outputs для T14_BURN_CAPTIONS
+    ctx.outputs["caption_params"] = {
+        "bottom_margin": bottom_margin,
+        "top_margin": top_margin,
+        "font_size": font_size,
+        "max_lines": max_lines,
+        "line_spacing": line_spacing,
+    }
+
     # Optionally build ASS too
     ass_path = None
     if fmt == "ass" or params.get("also_ass", False):
         font = params.get("font", "Arial")
-        font_size = params.get("font_size", 48)
         outline = params.get("outline", 2)
         position = params.get("position", "bottom")
         style = params.get("style", "bold")
+        margin_l = safe.get("left") or 30
+        margin_r = safe.get("right") or 30
 
         ass_content = _build_ass_file(
             segments=[{
@@ -1698,17 +1772,27 @@ async def handle_generate_captions(ctx: StepContext, params: dict) -> dict:
             text=ctx.caption_text or "",
             font=font, font_size=font_size, outline=outline,
             position=position, style=style,
+            margin_v=bottom_margin, margin_l=margin_l, margin_r=margin_r,
+            spacing=line_spacing,
         )
         ass_path = ctx.task_dir / "captions.ass"
         ass_path.write_text(ass_content, encoding="utf-8")
 
-    ctx.log(f"[G02_CAPTIONS] Built {len(segments)} caption segments")
+    ctx.log(
+        f"[G02_CAPTIONS] {len(segments)} segments, font_size={font_size}, "
+        f"bottom_margin={bottom_margin}, max_lines={max_lines}, line_spacing={line_spacing}"
+    )
 
     return {
         "srt_path": str(srt_path),
         "ass_path": str(ass_path) if ass_path else None,
         "segments_count": len(segments),
         "format": fmt,
+        "font_size": font_size,
+        "bottom_margin": bottom_margin,
+        "top_margin": top_margin,
+        "max_lines": max_lines,
+        "line_spacing": line_spacing,
     }
 
 
