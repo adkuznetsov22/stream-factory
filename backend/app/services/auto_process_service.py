@@ -172,9 +172,18 @@ async def run_auto_process(
     }
 
     if not dry_run and started:
-        # Fire-and-forget actual processing in background tasks
-        for item in started:
-            asyncio.create_task(_process_task_background(item["task_id"]))
+        # Dispatch to Celery worker (or fallback to asyncio if Celery disabled)
+        settings = get_settings()
+        if settings.celery_enabled:
+            from app.worker.tasks import process_task as celery_process_task
+            for item in started:
+                celery_process_task.apply_async(
+                    args=[item["task_id"]], queue="pipeline",
+                )
+                logger.info(f"[auto_process] Enqueued task {item['task_id']} to Celery")
+        else:
+            for item in started:
+                asyncio.create_task(_process_task_background(item["task_id"]))
 
     logger.info(
         f"[auto_process] Started {len(started)}, skipped {len(skipped)}, "
@@ -184,7 +193,7 @@ async def run_auto_process(
 
 
 async def _process_task_background(task_id: int):
-    """Run TaskProcessor.process_task in a fresh session (fire-and-forget)."""
+    """Fallback: run TaskProcessor in-process when Celery is disabled."""
     try:
         from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
         from app.settings import get_settings

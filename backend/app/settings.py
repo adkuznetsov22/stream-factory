@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     auto_process_interval_minutes: int = Field(default=5, validation_alias=AliasChoices("AUTO_PROCESS_INTERVAL_MINUTES", "STREAM_FACTORY_AUTO_PROCESS_INTERVAL_MINUTES"))
     auto_process_max_parallel: int = Field(default=2, validation_alias=AliasChoices("AUTO_PROCESS_MAX_PARALLEL", "STREAM_FACTORY_AUTO_PROCESS_MAX_PARALLEL"))
     auto_process_max_parallel_per_destination: int = Field(default=1, validation_alias=AliasChoices("AUTO_PROCESS_MAX_PARALLEL_PER_DESTINATION", "STREAM_FACTORY_AUTO_PROCESS_MAX_PARALLEL_PER_DESTINATION"))
+    redis_url: str = Field(default="redis://redis:6379/0", validation_alias=AliasChoices("REDIS_URL", "STREAM_FACTORY_REDIS_URL"))
+    celery_enabled: bool = Field(default=True, validation_alias=AliasChoices("CELERY_ENABLED", "STREAM_FACTORY_CELERY_ENABLED"))
     watchdog_enabled: bool = Field(default=True, validation_alias=AliasChoices("WATCHDOG_ENABLED", "STREAM_FACTORY_WATCHDOG_ENABLED"))
     watchdog_interval_minutes: int = Field(default=5, validation_alias=AliasChoices("WATCHDOG_INTERVAL_MINUTES", "STREAM_FACTORY_WATCHDOG_INTERVAL_MINUTES"))
     stuck_processing_minutes: int = Field(default=90, validation_alias=AliasChoices("STUCK_PROCESSING_MINUTES", "STREAM_FACTORY_STUCK_PROCESSING_MINUTES"))

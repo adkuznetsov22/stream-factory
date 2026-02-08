@@ -16,6 +16,17 @@ services:
     networks:
       - stream-net
 
+  redis:
+    image: redis:7-alpine
+    container_name: stream-factory-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - stream-net
+
   backend:
     build:
       context: .
@@ -29,17 +40,43 @@ services:
       PORT: 8000
       STREAM_FACTORY_ENVIRONMENT: docker
       STREAM_FACTORY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/stream_factory
+      REDIS_URL: redis://redis:6379/0
       APIFY_TOKEN: ${APIFY_TOKEN}
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/ping || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - stream-net
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: stream-factory-worker
+    command: celery -A app.worker.celery_app worker -l info -Q pipeline -c 2
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env
+    environment:
+      STREAM_FACTORY_ENVIRONMENT: docker
+      STREAM_FACTORY_DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/stream_factory
+      REDIS_URL: redis://redis:6379/0
+      APIFY_TOKEN: ${APIFY_TOKEN}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - stream-net
 

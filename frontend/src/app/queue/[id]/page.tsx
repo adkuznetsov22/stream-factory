@@ -349,6 +349,18 @@ export default function TaskDetailPage() {
     await loadLog(tailSize);
   };
 
+  const handleEnqueue = async () => {
+    if (!taskId) return;
+    setActionError(null);
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/enqueue`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Ошибка" }));
+      setActionError(typeof err.detail === "string" ? err.detail : "Не удалось отправить в очередь");
+      return;
+    }
+    await fetchData();
+  };
+
   const handleRetryPublish = async (force = false) => {
     if (!taskId) return;
     setActionError(null);
@@ -399,6 +411,9 @@ export default function TaskDetailPage() {
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               <button style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid var(--border-primary)", background: "transparent", color: "var(--text-primary)", cursor: "pointer" }} onClick={() => router.push("/queue")}>
                 Назад
+              </button>
+              <button style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#f59e0b", color: "#fff", fontWeight: 600, cursor: "pointer" }} onClick={handleEnqueue} disabled={!(data?.actions?.can_process_v2 ?? true)}>
+                ⚡ Enqueue
               </button>
               <button style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "var(--accent)", color: "#fff", fontWeight: 600, cursor: "pointer" }} onClick={handleProcess} disabled={!(data?.actions?.can_process ?? true)}>
                 Обработать

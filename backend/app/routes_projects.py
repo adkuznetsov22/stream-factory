@@ -1624,6 +1624,44 @@ async def get_project_mixed_pool(
     return result
 
 
+@router.post("/publish-tasks/{task_id}/enqueue", response_model=dict)
+async def enqueue_task(task_id: int, session: AsyncSession = SessionDep):
+    """Enqueue a task for pipeline processing via Celery worker."""
+    from app.settings import get_settings
+
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    if task.status not in ("queued", "error", "ready_for_review", "done"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot enqueue task with status '{task.status}'",
+        )
+
+    settings = get_settings()
+    if not settings.celery_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Celery is disabled (CELERY_ENABLED=false)",
+        )
+
+    # Set status to queued so worker picks it up correctly
+    task.status = "queued"
+    task.publish_error = None
+    session.add(task)
+    await session.commit()
+
+    from app.worker.tasks import process_task as celery_process_task
+    result = celery_process_task.apply_async(args=[task_id], queue="pipeline")
+
+    return {
+        "enqueued": True,
+        "task_id": task_id,
+        "celery_task_id": result.id,
+    }
+
+
 @router.post("/publish-tasks/{task_id}/process-v2", response_model=dict)
 async def process_task_v2(task_id: int, session: AsyncSession = SessionDep):
     """
