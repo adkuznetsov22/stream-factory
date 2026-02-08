@@ -71,11 +71,16 @@ app.include_router(briefs_router)
 
 @app.on_event("startup")
 async def startup_event():
-    """Start scheduler on app startup."""
+    """Start scheduler on app startup (respects SCHEDULER_ENABLED)."""
     from app.services.scheduler import scheduler_service
     scheduler_service.configure(settings.database_url)
+
+    if not settings.scheduler_enabled:
+        logger.info("Scheduler DISABLED (SCHEDULER_ENABLED=false) — this instance will NOT run scheduled jobs")
+        return
+
     scheduler_service.start()
-    logger.info("Scheduler started on app startup")
+    logger.info("Scheduler started on app startup (advisory-lock leader election active)")
 
 
 @app.on_event("shutdown")
