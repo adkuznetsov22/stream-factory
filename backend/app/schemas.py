@@ -294,6 +294,10 @@ class PresetStepUpdate(BaseModel):
     requires_moderation: bool | None = None
 
 
+class PresetStepMove(BaseModel):
+    direction: str  # "up" or "down"
+
+
 class PresetStepRead(BaseModel):
     id: int
     preset_id: int

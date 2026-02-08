@@ -12,6 +12,7 @@ from app.schemas import (
     PresetCreate,
     PresetRead,
     PresetStepCreate,
+    PresetStepMove,
     PresetStepRead,
     PresetStepUpdate,
     PresetUpdate,
@@ -115,6 +116,90 @@ async def delete_preset_step(step_id: int, session: AsyncSession = SessionDep):
     await session.delete(step)
     await session.commit()
     return {}
+
+
+async def normalize_order_indices(session: AsyncSession, preset_id: int) -> None:
+    """Normalize order_index to 10, 20, 30... to leave room for future insertions."""
+    res = await session.execute(
+        select(PresetStep).where(PresetStep.preset_id == preset_id).order_by(PresetStep.order_index)
+    )
+    steps = res.scalars().all()
+    for i, step in enumerate(steps):
+        step.order_index = (i + 1) * 10
+        session.add(step)
+
+
+@router.post("/preset-steps/{step_id}/move", response_model=list[PresetStepRead])
+async def move_preset_step(step_id: int, data: PresetStepMove, session: AsyncSession = SessionDep):
+    """Move step up or down by swapping order_index with neighbor. Returns updated steps list."""
+    if data.direction not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="direction must be 'up' or 'down'")
+
+    step = await session.get(PresetStep, step_id)
+    if not step:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preset step not found")
+
+    # Get all steps for this preset ordered
+    res = await session.execute(
+        select(PresetStep).where(PresetStep.preset_id == step.preset_id).order_by(PresetStep.order_index)
+    )
+    steps = list(res.scalars().all())
+
+    # Find current index in sorted list
+    current_idx = next((i for i, s in enumerate(steps) if s.id == step_id), None)
+    if current_idx is None:
+        raise HTTPException(status_code=500, detail="Step not found in preset")
+
+    # Determine neighbor index
+    if data.direction == "up":
+        if current_idx == 0:
+            raise HTTPException(status_code=400, detail="Already at top")
+        neighbor_idx = current_idx - 1
+    else:
+        if current_idx == len(steps) - 1:
+            raise HTTPException(status_code=400, detail="Already at bottom")
+        neighbor_idx = current_idx + 1
+
+    neighbor = steps[neighbor_idx]
+
+    # Check for collision - if order_index values are equal or adjacent swap would collide
+    # Normalize if needed (when indices are too close or equal)
+    if abs(step.order_index - neighbor.order_index) <= 1:
+        await normalize_order_indices(session, step.preset_id)
+        await session.flush()
+        # Re-fetch after normalization
+        res = await session.execute(
+            select(PresetStep).where(PresetStep.preset_id == step.preset_id).order_by(PresetStep.order_index)
+        )
+        steps = list(res.scalars().all())
+        step = steps[current_idx]
+        neighbor = steps[neighbor_idx]
+
+    # Atomic swap
+    step.order_index, neighbor.order_index = neighbor.order_index, step.order_index
+    session.add(step)
+    session.add(neighbor)
+    await session.commit()
+
+    # Return updated list
+    res = await session.execute(
+        select(PresetStep).where(PresetStep.preset_id == step.preset_id).order_by(PresetStep.order_index)
+    )
+    return res.scalars().all()
+
+
+@router.post("/presets/{preset_id}/normalize-order", response_model=list[PresetStepRead])
+async def normalize_preset_order(preset_id: int, session: AsyncSession = SessionDep):
+    """Normalize order_index values to 10, 20, 30... for a preset."""
+    preset = await session.get(Preset, preset_id)
+    if not preset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preset not found")
+    await normalize_order_indices(session, preset_id)
+    await session.commit()
+    res = await session.execute(
+        select(PresetStep).where(PresetStep.preset_id == preset_id).order_by(PresetStep.order_index)
+    )
+    return res.scalars().all()
 
 
 @router.get("/presets/{preset_id}/assets", response_model=list[PresetAssetRead])
