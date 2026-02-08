@@ -453,6 +453,9 @@ class Project(Base):
         back_populates="project", cascade="save-update", passive_deletes=True
     )
     preset: Mapped["Preset | None"] = relationship(back_populates="projects")
+    candidates: Mapped[list["Candidate"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class ProjectSource(Base):
@@ -537,6 +540,9 @@ class PublishTask(Base):
     )
     step_results: Mapped[list["StepResult"]] = relationship(
         back_populates="task", cascade="all, delete-orphan", passive_deletes=True
+    )
+    candidate: Mapped["Candidate | None"] = relationship(
+        back_populates="publish_task", uselist=False
     )
 
 
@@ -683,4 +689,65 @@ class StepResult(Base):
     task: Mapped["PublishTask"] = relationship(back_populates="step_results")
     previous_version: Mapped["StepResult | None"] = relationship(
         remote_side=[id], foreign_keys=[previous_version_id]
+    )
+
+
+class CandidateStatus(str, Enum):
+    new = "NEW"
+    approved = "APPROVED"
+    rejected = "REJECTED"
+    used = "USED"
+
+
+class Candidate(Base):
+    """Video candidate from competitor feed or generation."""
+    __tablename__ = "candidates"
+    __table_args__ = (
+        sa.UniqueConstraint("project_id", "platform", "platform_video_id", name="uq_candidate_video"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(sa.ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Source identification
+    platform: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    platform_video_id: Mapped[str] = mapped_column(sa.String(512), nullable=False)
+    url: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    author: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+    title: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    caption: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    thumbnail_url: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+
+    # Metrics
+    views: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+    likes: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+    comments: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+    shares: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+    subscribers: Mapped[int | None] = mapped_column(sa.BigInteger(), nullable=True)
+
+    # Scoring
+    virality_score: Mapped[float | None] = mapped_column(sa.Float(), nullable=True, index=True)
+    virality_factors: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+
+    # Status & review
+    status: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default="NEW", index=True)
+    manual_rating: Mapped[int | None] = mapped_column(sa.SmallInteger(), nullable=True)
+    notes: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+
+    # Link to publish task
+    linked_publish_task_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("publish_tasks.id", ondelete="SET NULL"), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now(), nullable=False
+    )
+
+    # Relationships
+    project: Mapped[Project] = relationship(back_populates="candidates")
+    publish_task: Mapped["PublishTask | None"] = relationship(
+        back_populates="candidate", foreign_keys=[linked_publish_task_id]
     )

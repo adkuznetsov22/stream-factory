@@ -20,6 +20,7 @@ from .routes_virality import router as virality_router
 from .routes_scheduler import router as scheduler_router
 from .routes_dashboard import router as dashboard_router
 from .routes_auth import router as auth_router
+from .routes_feed import router as feed_router
 from .settings import get_settings
 
 logger = logging.getLogger("app")
@@ -63,6 +64,7 @@ app.include_router(virality_router)
 app.include_router(scheduler_router)
 app.include_router(dashboard_router)
 app.include_router(auth_router)
+app.include_router(feed_router)
 
 
 @app.on_event("startup")

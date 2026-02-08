@@ -415,3 +415,64 @@ class ModerationQueueItem(BaseModel):
 
 class TaskModerationModeUpdate(BaseModel):
     moderation_mode: str  # auto, manual, step_by_step
+
+
+# ── Candidates / Feed ──────────────────────────────────────────
+
+class CandidateRead(BaseModel):
+    id: int
+    project_id: int
+    platform: str
+    platform_video_id: str
+    url: str | None = None
+    author: str | None = None
+    title: str | None = None
+    caption: str | None = None
+    thumbnail_url: str | None = None
+    published_at: datetime | None = None
+    views: int | None = None
+    likes: int | None = None
+    comments: int | None = None
+    shares: int | None = None
+    subscribers: int | None = None
+    virality_score: float | None = None
+    virality_factors: dict | None = None
+    status: str
+    manual_rating: int | None = None
+    notes: str | None = None
+    reviewed_at: datetime | None = None
+    linked_publish_task_id: int | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class CandidateCreate(BaseModel):
+    platform: str
+    platform_video_id: str
+    url: str | None = None
+    author: str | None = None
+    title: str | None = None
+    caption: str | None = None
+    thumbnail_url: str | None = None
+    published_at: datetime | None = None
+    views: int | None = None
+    likes: int | None = None
+    comments: int | None = None
+    shares: int | None = None
+    subscribers: int | None = None
+    virality_score: float | None = None
+    virality_factors: dict | None = None
+
+
+class CandidateRateRequest(BaseModel):
+    manual_rating: int
+    notes: str | None = None
+
+
+class CandidateApproveResponse(BaseModel):
+    candidate_id: int
+    task_id: int
+    status: str
