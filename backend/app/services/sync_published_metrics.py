@@ -84,8 +84,10 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
         select(PublishTask)
         .where(and_(
             PublishTask.status == "published",
-            PublishTask.published_external_id.isnot(None),
+            PublishTask.published_at.isnot(None),
             PublishTask.published_at >= cutoff,
+            # Must have at least external_id or published_url to fetch metrics
+            PublishTask.published_external_id.isnot(None),
         ))
     )
     result = await session.execute(query)
