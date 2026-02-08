@@ -490,11 +490,15 @@ class BriefRead(BaseModel):
     id: int
     project_id: int
     title: str
+    topic: str | None = None
     description: str | None = None
     target_platform: str | None = None
     style: str | None = None
     tone: str | None = None
     language: str = "ru"
+    target_duration_sec: int | None = None
+    reference_urls: list | dict | None = None
+    llm_prompt_template: str | None = None
     prompts: dict | None = None
     assets: dict | None = None
     settings: dict | None = None
@@ -508,11 +512,15 @@ class BriefRead(BaseModel):
 
 class BriefCreate(BaseModel):
     title: str
+    topic: str | None = None
     description: str | None = None
     target_platform: str | None = None
     style: str | None = None
     tone: str | None = None
     language: str = "ru"
+    target_duration_sec: int | None = None
+    reference_urls: list | dict | None = None
+    llm_prompt_template: str | None = None
     prompts: dict | None = None
     assets: dict | None = None
     settings: dict | None = None
@@ -520,11 +528,15 @@ class BriefCreate(BaseModel):
 
 class BriefUpdate(BaseModel):
     title: str | None = None
+    topic: str | None = None
     description: str | None = None
     target_platform: str | None = None
     style: str | None = None
     tone: str | None = None
     language: str | None = None
+    target_duration_sec: int | None = None
+    reference_urls: list | dict | None = None
+    llm_prompt_template: str | None = None
     prompts: dict | None = None
     assets: dict | None = None
     settings: dict | None = None

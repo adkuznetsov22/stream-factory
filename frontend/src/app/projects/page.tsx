@@ -164,6 +164,12 @@ export default function ProjectsPage() {
                         📋 Feed
                       </button>
                       <button
+                        onClick={() => window.location.href = `/projects/${p.id}/briefs`}
+                        style={{ padding: "8px 16px", background: "#8b5cf620", color: "#8b5cf6", borderRadius: 6, fontSize: 13, fontWeight: 500 }}
+                      >
+                        📝 Briefs
+                      </button>
+                      <button
                         onClick={() => runNow(p.id)}
                         style={{ padding: "8px 16px", background: "var(--accent)", color: "#fff", borderRadius: 6, fontSize: 13, fontWeight: 500 }}
                       >
