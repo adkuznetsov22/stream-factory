@@ -1880,6 +1880,7 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
     """
     import asyncio
     import traceback
+    from sqlalchemy import text as sa_text
     from app.models import PublishTask, SocialAccount, Candidate, CandidateStatus, StepResult
     from app.services.publisher_adapter import get_publisher, PublishResult
 
@@ -1890,10 +1891,15 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
         raise RuntimeError("P01_PUBLISH requires session and publish_task in StepContext")
 
     # ── Idempotency check ────────────────────────────────────
-    if task.published_url and task.status == "published":
+    # Считаем задачу уже опубликованной, если есть published_url ИЛИ published_external_id
+    already_published = (
+        task.status == "published"
+        and (task.published_url or task.published_external_id)
+    )
+    if already_published:
         ctx.log(
             f"[P01_PUBLISH] Idempotency: task #{task.id} already published "
-            f"to {task.published_url} — skipping"
+            f"(url={task.published_url}, ext_id={task.published_external_id}) — skipping"
         )
         return {
             "published": True,
@@ -1902,6 +1908,62 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
             "platform": task.platform,
             "idempotent_skip": True,
         }
+
+    # ── In-progress protection (advisory lock per task) ──────
+    # Prevents a second worker from publishing the same task concurrently.
+    # Lock key: 800_000 + task_id — unique per task, separate namespace from scheduler locks.
+    publish_lock_key = 800_000 + task.id
+    lock_result = await session.execute(sa_text(f"SELECT pg_try_advisory_lock({publish_lock_key})"))
+    lock_acquired = bool(lock_result.scalar())
+
+    if not lock_acquired:
+        ctx.log(
+            f"[P01_PUBLISH] Advisory lock NOT acquired for task #{task.id} — "
+            f"another worker is already publishing this task, skipping"
+        )
+        return {
+            "published": False,
+            "skipped": True,
+            "reason": "concurrent_publish_in_progress",
+        }
+
+    try:
+        # Re-read task status under lock to catch race condition
+        await session.refresh(task)
+        if task.status == "publishing":
+            ctx.log(
+                f"[P01_PUBLISH] Task #{task.id} status is 'publishing' (race detected) — skipping"
+            )
+            return {
+                "published": False,
+                "skipped": True,
+                "reason": "already_publishing",
+            }
+        if task.status == "published" and (task.published_url or task.published_external_id):
+            ctx.log(
+                f"[P01_PUBLISH] Task #{task.id} was published between lock acquire and re-check — skipping"
+            )
+            return {
+                "published": True,
+                "published_url": task.published_url,
+                "published_external_id": task.published_external_id,
+                "platform": task.platform,
+                "idempotent_skip": True,
+            }
+
+        return await _do_publish(ctx, params, task, session)
+    finally:
+        # Always release advisory lock
+        await session.execute(sa_text(f"SELECT pg_advisory_unlock({publish_lock_key})"))
+
+
+async def _do_publish(ctx: StepContext, params: dict, task, session) -> dict:
+    """Core publish logic — called under advisory lock."""
+    import asyncio
+    import traceback
+    from sqlalchemy import select as sa_select
+    from app.models import SocialAccount, Candidate, CandidateStatus
+    from app.services.publisher_adapter import get_publisher, PublishResult
 
     # ── Resolve output video ─────────────────────────────────
     input_path = ctx.get_input_video()
@@ -2022,7 +2084,6 @@ async def handle_publish(ctx: StepContext, params: dict) -> dict:
         session.add(task)
 
         # Update linked Candidate → USED
-        from sqlalchemy import select as sa_select
         cand_q = await session.execute(
             sa_select(Candidate).where(Candidate.linked_publish_task_id == task.id)
         )
