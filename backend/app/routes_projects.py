@@ -1408,6 +1408,21 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
         ],
     }
 
+    # Detect final video file on disk
+    _task_dir = Path(f"/data/tasks/{task.id}")
+    _final_video_filename: str | None = None
+    for _vname in ("final.mp4", "ready.mp4"):
+        _vpath = _task_dir / _vname
+        if _vpath.exists() and _vpath.stat().st_size > 0:
+            _final_video_filename = _vname
+            break
+    if not _final_video_filename:
+        for _akey in ("final_video_path", "ready_video_path"):
+            _ap = artifacts.get(_akey)
+            if _ap and Path(str(_ap)).exists():
+                _final_video_filename = Path(str(_ap)).name
+                break
+
     actions = {
         "can_process": task.status in {"queued", "error"},
         "can_process_v2": task.status in {"queued", "error", "done"},
@@ -1417,6 +1432,8 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
         ),
         "can_mark_done": task.status not in {"done", "completed"},
         "can_mark_error": task.status != "error",
+        "can_mark_ready_for_publish": task.status in {"ready_for_review", "done"} and _final_video_filename is not None,
+        "can_download": _final_video_filename is not None,
     }
 
     # Publish info
@@ -1506,6 +1523,7 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
         "candidate": candidate_info,
         "step_results": step_results_data,
         "celery_task_id": task.celery_task_id,
+        "final_video_filename": _final_video_filename,
     }
     return response
 
@@ -1816,22 +1834,36 @@ async def mark_ready_for_publish(task_id: int, session: AsyncSession = SessionDe
     checks: list[dict] = []
     has_errors = False
 
-    # 1. Статус — не canceled, не paused, не published
-    blocked_statuses = {"canceled", "paused", "published", "ready_for_publish"}
-    if task.status in blocked_statuses:
-        checks.append({"check": "status", "ok": False, "detail": f"Недопустимый статус: {task.status}"})
+    # 1. Статус — только ready_for_review или done
+    allowed_statuses = {"ready_for_review", "done"}
+    if task.status not in allowed_statuses:
+        checks.append({"check": "status", "ok": False, "detail": f"Недопустимый статус: {task.status} (нужен ready_for_review или done)"})
         has_errors = True
     else:
         checks.append({"check": "status", "ok": True, "detail": task.status})
 
-    # 2. Итоговый видеофайл
-    artifacts = task.artifacts or {}
-    video_path = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
-    if video_path:
-        checks.append({"check": "video_file", "ok": True, "detail": video_path.split("/")[-1] if isinstance(video_path, str) else "yes"})
+    # 2. Итоговый видеофайл — проверяем на диске
+    task_dir = Path(f"/data/tasks/{task_id}")
+    final_path = task_dir / "final.mp4"
+    ready_path = task_dir / "ready.mp4"
+    found_file: str | None = None
+    if final_path.exists() and final_path.stat().st_size > 0:
+        found_file = "final.mp4"
+    elif ready_path.exists() and ready_path.stat().st_size > 0:
+        found_file = "ready.mp4"
+
+    if found_file:
+        checks.append({"check": "video_file", "ok": True, "detail": found_file})
     else:
-        checks.append({"check": "video_file", "ok": False, "detail": "Нет итогового видео (final.mp4 / ready.mp4)"})
-        has_errors = True
+        # Fallback: check artifacts
+        artifacts = task.artifacts or {}
+        video_path = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
+        if video_path and Path(str(video_path)).exists():
+            found_file = Path(str(video_path)).name
+            checks.append({"check": "video_file", "ok": True, "detail": found_file})
+        else:
+            checks.append({"check": "video_file", "ok": False, "detail": "Нет итогового видео (final.mp4 / ready.mp4)"})
+            has_errors = True
 
     # 3. Нет publish_error
     if task.publish_error:
@@ -1854,7 +1886,6 @@ async def mark_ready_for_publish(task_id: int, session: AsyncSession = SessionDe
         checks.append({"check": "qc_pass", "ok": False, "detail": f"T18_QC status={qc_result.status}"})
         has_errors = True
     else:
-        # QC шаг не найден — не блокируем (пресет может не включать QC)
         checks.append({"check": "qc_pass", "ok": True, "detail": "T18_QC not in preset (skipped)"})
 
     if has_errors:
@@ -1879,7 +1910,45 @@ async def mark_ready_for_publish(task_id: int, session: AsyncSession = SessionDe
     await session.commit()
     await session.refresh(task)
 
-    return {"ok": True, "task_id": task_id, "status": task.status, "checks": checks}
+    return {"ok": True, "task_id": task_id, "status": task.status, "file": found_file, "checks": checks}
+
+
+# ── Download final video ─────────────────────────────────────
+
+@router.get("/publish-tasks/{task_id}/download")
+async def download_final_video(task_id: int, session: AsyncSession = SessionDep):
+    """Download final.mp4 (or ready.mp4) for a task."""
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    task_dir = Path(f"/data/tasks/{task_id}")
+    for name in ("final.mp4", "ready.mp4"):
+        fpath = task_dir / name
+        if fpath.exists() and fpath.stat().st_size > 0:
+            from fastapi.responses import FileResponse
+            return FileResponse(
+                path=str(fpath),
+                media_type="video/mp4",
+                filename=f"task_{task_id}_{name}",
+                headers={"Content-Disposition": f'attachment; filename="task_{task_id}_{name}"'},
+            )
+
+    # Fallback: check artifacts paths
+    artifacts = task.artifacts or {}
+    for key in ("final_video_path", "ready_video_path"):
+        p = artifacts.get(key)
+        if p and Path(str(p)).exists():
+            fname = Path(str(p)).name
+            from fastapi.responses import FileResponse
+            return FileResponse(
+                path=str(p),
+                media_type="video/mp4",
+                filename=f"task_{task_id}_{fname}",
+                headers={"Content-Disposition": f'attachment; filename="task_{task_id}_{fname}"'},
+            )
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No final video file found")
 
 
 # ── Daily Publish Plan ────────────────────────────────────────

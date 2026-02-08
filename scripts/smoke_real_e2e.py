@@ -336,6 +336,26 @@ def step9_mark_ready(task_id: int) -> bool:
         return False
 
 
+def step9b_download(task_id: int):
+    step("9b. Download final video")
+    url = f"{BASE_URL}/api/publish-tasks/{task_id}/download"
+    req = Request(url, headers=_headers(), method="GET")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            size = len(resp.read())
+            ct = resp.headers.get("Content-Type", "")
+            cd = resp.headers.get("Content-Disposition", "")
+            if size > 0:
+                ok(f"Download OK: {size} bytes, Content-Type={ct}")
+                ok(f"Content-Disposition: {cd}")
+            else:
+                fail("Download returned empty body")
+    except HTTPError as e:
+        fail(f"Download failed: {e.code} {e.read().decode()[:200]}")
+    except URLError as e:
+        fail(f"Download failed: {e}")
+
+
 def step10_dry_run_plan(project_id: int, task_id: int):
     step("10. Auto-publish DRY RUN (publish-plan)")
     try:
@@ -418,6 +438,9 @@ def main():
 
         # 9. Mark ready
         ready_ok = step9_mark_ready(task_id)
+
+        # 9b. Download final video
+        step9b_download(task_id)
 
         # 10. Dry-run plan
         step10_dry_run_plan(project_id, task_id)
