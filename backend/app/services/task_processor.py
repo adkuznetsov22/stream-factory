@@ -133,6 +133,19 @@ class TaskProcessor:
         try:
             result = await executor.execute_steps(steps)
             
+            # Ensure final.mp4 exists after successful pipeline
+            if result["success"] and not ctx.final_path.exists():
+                # Copy from current_video or ready.mp4
+                src = ctx.current_video
+                if not src or not src.exists():
+                    src = ctx.ready_path if ctx.ready_path.exists() else None
+                if not src or not src.exists():
+                    src = ctx.raw_path if ctx.raw_path.exists() else None
+                if src and src.exists():
+                    import shutil
+                    shutil.copy2(src, ctx.final_path)
+                    log_cb(f"[ensure_final] Copied {src.name} → final.mp4")
+            
             # Build artifacts
             artifacts = {
                 "raw_video_path": str(ctx.raw_path) if ctx.raw_path.exists() else None,

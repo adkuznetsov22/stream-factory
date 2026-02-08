@@ -39,7 +39,7 @@ type UiTask = {
   created_at?: string | null;
   updated_at?: string | null;
 };
-type UiActions = { can_process: boolean; can_process_v2: boolean; can_retry_publish: boolean; can_mark_done: boolean; can_mark_error: boolean };
+type UiActions = { can_process: boolean; can_process_v2: boolean; can_retry_publish: boolean; can_mark_done: boolean; can_mark_error: boolean; can_mark_ready_for_publish: boolean; can_download: boolean };
 type PublishInfo = {
   published_url?: string | null;
   published_external_id?: string | null;
@@ -526,13 +526,22 @@ export default function TaskDetailPage() {
                   ✕ Отмена
                 </button>
               )}
-              {data && (data.task.status === "done" || data.task.status === "ready_for_review") && (
+              {data && data.actions?.can_mark_ready_for_publish && (
                 <button
                   style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#0ea5e9", color: "#fff", fontWeight: 600, cursor: "pointer" }}
                   onClick={handleMarkReadyForPublish}
                 >
                   🚀 Ready for Publish
                 </button>
+              )}
+              {data && data.actions?.can_download && (
+                <a
+                  href={`${API_BASE}/api/publish-tasks/${taskId}/download`}
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#7c3aed", color: "#fff", fontWeight: 600, cursor: "pointer", textDecoration: "none", display: "inline-block" }}
+                  download
+                >
+                  ⬇ Download {(data as any).final_video_filename || "video"}
+                </a>
               )}
             </div>
           </div>
