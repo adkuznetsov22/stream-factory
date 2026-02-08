@@ -839,6 +839,9 @@ class PublishedVideoMetrics(Base):
     Enables analytics: candidate_score → actual performance.
     """
     __tablename__ = "published_video_metrics"
+    __table_args__ = (
+        sa.UniqueConstraint("platform", "external_id", "snapshot_at", name="uq_pvm_platform_extid_snap"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     task_id: Mapped[int] = mapped_column(

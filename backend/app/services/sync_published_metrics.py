@@ -89,7 +89,10 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
                 if cand_row:
                     candidate_id = cand_row[0]
 
-                snapshot = PublishedVideoMetrics(
+                # Upsert: skip if snapshot already exists for this (platform, external_id, snapshot_at)
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                stmt = pg_insert(PublishedVideoMetrics).values(
                     task_id=task.id,
                     candidate_id=candidate_id,
                     platform=platform,
@@ -101,8 +104,17 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
                     snapshot_at=now,
                     hours_since_publish=hours_since,
                     raw_data=metrics.get("raw"),
+                ).on_conflict_do_update(
+                    constraint="uq_pvm_platform_extid_snap",
+                    set_={
+                        "views": metrics.get("views"),
+                        "likes": metrics.get("likes"),
+                        "comments": metrics.get("comments"),
+                        "shares": metrics.get("shares"),
+                        "raw_data": metrics.get("raw"),
+                    },
                 )
-                session.add(snapshot)
+                await session.execute(stmt)
                 synced += 1
 
             await session.commit()
