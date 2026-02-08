@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate preflight smoke reset
+.PHONY: up down logs migrate preflight smoke smoke-real reset
 
 BASE_URL ?= http://localhost:8000
 
@@ -22,6 +22,9 @@ preflight:
 
 smoke:
 	python3 scripts/smoke_e2e.py
+
+smoke-real:
+	@if [ -f .env.real_test ]; then set -a && . ./.env.real_test && set +a; fi && python3 scripts/smoke_real_e2e.py
 
 reset:
 	@echo "WARNING: This will destroy all data (volumes)!"
