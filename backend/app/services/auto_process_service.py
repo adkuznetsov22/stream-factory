@@ -95,9 +95,9 @@ async def run_auto_process(
         )
         score_map = {row[0]: row[1] for row in cand_q.all()}
 
-    # Sort: highest virality_score first, then created_at asc (already ordered)
+    # Sort: priority DESC, then virality_score DESC, then created_at ASC
     eligible_tasks.sort(
-        key=lambda t: (-(score_map.get(t.id) or 0), t.created_at or now)
+        key=lambda t: (-t.priority, -(score_map.get(t.id) or 0), t.created_at or now)
     )
 
     started: list[dict] = []

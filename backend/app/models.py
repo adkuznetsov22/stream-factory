@@ -566,6 +566,8 @@ class PublishTask(Base):
     current_step_index: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="0")
     pipeline_status: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default="pending")
     total_steps: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="0")
+    # Priority (-10..+10, higher = processed first)
+    priority: Mapped[int] = mapped_column(sa.Integer(), nullable=False, server_default="0")
     # Task control
     pause_requested_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     paused_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
