@@ -14,17 +14,19 @@ type FeedSettings = {
   daily_limit_per_destination?: number;
   cooldown_hours_per_source?: number;
   min_score_override?: number | null;
+  origin_filter?: string;
 };
 
 type AutoApproveReport = {
   threshold: number;
   approved_count: number;
   skipped_count: number;
-  approved: { candidate_id: number; task_id: number; score: number; title?: string; destination_platform?: string }[];
+  approved: { candidate_id: number; task_id: number | null; score: number; title?: string; destination_platform?: string; dry_run?: boolean }[];
   skipped: { candidate_id: number; score: number; reason: string }[];
   daily_limits?: Record<string, { platform: string; used: number; limit: number }>;
   run_at?: string;
   error?: string;
+  dry_run?: boolean;
 };
 
 type Project = {
@@ -52,13 +54,14 @@ function AutoApproveBlock({
   onUpdate: (fs: FeedSettings) => void;
   report: AutoApproveReport | null;
   running: boolean;
-  onRunNow: () => void;
+  onRunNow: (dryRun: boolean) => void;
 }) {
   const fs: FeedSettings = project.feed_settings || {};
   const enabled = fs.auto_approve_enabled ?? false;
   const dailyLimit = fs.daily_limit_per_destination ?? 3;
   const cooldown = fs.cooldown_hours_per_source ?? 12;
   const scoreOverride = fs.min_score_override ?? null;
+  const originFilter = fs.origin_filter ?? "ALL";
 
   const set = (patch: Partial<FeedSettings>) => onUpdate({ ...fs, ...patch });
 
@@ -84,7 +87,7 @@ function AutoApproveBlock({
 
         {enabled && (
           <>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
               <div>
                 <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>
                   Лимит / назначение / день
@@ -97,7 +100,7 @@ function AutoApproveBlock({
               </div>
               <div>
                 <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>
-                  Cooldown автора (часы)
+                  Cooldown источника (ч)
                 </label>
                 <input
                   type="number" min={0} max={168} value={cooldown}
@@ -117,26 +120,57 @@ function AutoApproveBlock({
                   style={{ width: "100%" }}
                 />
               </div>
+              <div>
+                <label style={{ display: "block", fontSize: 11, color: "var(--fg-subtle)", marginBottom: 4 }}>
+                  Тип кандидатов
+                </label>
+                <select
+                  value={originFilter}
+                  onChange={e => set({ origin_filter: e.target.value })}
+                  style={{ width: "100%" }}
+                >
+                  <option value="ALL">Все</option>
+                  <option value="REPURPOSE">Repurpose</option>
+                  <option value="GENERATE">Generate</option>
+                </select>
+              </div>
             </div>
 
-            {/* Run Now button */}
-            <button
-              onClick={onRunNow}
-              disabled={running}
-              style={{
-                padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
-                background: running ? "var(--bg-muted)" : "#22c55e20",
-                color: running ? "var(--fg-subtle)" : "#22c55e",
-                border: "1px solid #22c55e40",
-              }}
-            >
-              {running ? "Запуск..." : "▶ Запустить сейчас"}
-            </button>
+            {/* Run buttons */}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => onRunNow(false)}
+                disabled={running}
+                style={{
+                  padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  background: running ? "var(--bg-muted)" : "#22c55e20",
+                  color: running ? "var(--fg-subtle)" : "#22c55e",
+                  border: "1px solid #22c55e40",
+                }}
+              >
+                {running ? "Запуск..." : "▶ Запустить"}
+              </button>
+              <button
+                onClick={() => onRunNow(true)}
+                disabled={running}
+                style={{
+                  padding: "6px 16px", borderRadius: 8, fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  background: running ? "var(--bg-muted)" : "#dbeafe",
+                  color: running ? "var(--fg-subtle)" : "#2563eb",
+                  border: "1px solid #93c5fd",
+                }}
+              >
+                Dry Run
+              </button>
+            </div>
 
             {/* Report */}
             {report && (
               <div style={{ marginTop: 12, padding: 12, background: "var(--bg-subtle)", borderRadius: 8, border: "1px solid var(--border)" }}>
-                <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12 }}>
+                <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12, alignItems: "center" }}>
+                  {report.dry_run && (
+                    <span style={{ background: "#dbeafe", color: "#2563eb", padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 600 }}>DRY RUN</span>
+                  )}
                   <span>Порог: <strong>{report.threshold?.toFixed(2)}</strong></span>
                   <span style={{ color: "#22c55e" }}>Одобрено: <strong>{report.approved_count}</strong></span>
                   <span style={{ color: "#ef4444" }}>Пропущено: <strong>{report.skipped_count}</strong></span>
@@ -465,13 +499,14 @@ export default function ProjectsPage() {
                       onUpdate={(fs) => updateProject(p.id, { feed_settings: fs } as any)}
                       report={expanded === p.id ? aaReport : null}
                       running={aaRunning}
-                      onRunNow={async () => {
+                      onRunNow={async (dryRun: boolean) => {
                         setAaRunning(true);
                         setAaReport(null);
-                        const res = await fetch(`/api/projects/${p.id}/auto-approve`, { method: "POST" });
+                        const qs = dryRun ? "?dry_run=true" : "";
+                        const res = await fetch(`/api/projects/${p.id}/auto-approve${qs}`, { method: "POST" });
                         if (res.ok) setAaReport(await res.json());
                         setAaRunning(false);
-                        load();
+                        if (!dryRun) load();
                       }}
                     />
 

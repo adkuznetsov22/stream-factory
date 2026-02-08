@@ -2045,15 +2045,20 @@ async def run_scoring_calibration(project_id: int, session: AsyncSession = Sessi
 
 
 @router.post("/projects/{project_id}/auto-approve", response_model=dict)
-async def trigger_auto_approve(project_id: int, session: AsyncSession = SessionDep):
+async def trigger_auto_approve(
+    project_id: int,
+    dry_run: bool = Query(default=False),
+    session: AsyncSession = SessionDep,
+):
     """Manually trigger auto-approve for a project.
 
     Uses scoring calibration threshold (or min_score_override from feed_settings)
     to approve high-scoring candidates, respecting daily limits and cooldowns.
+    Pass ?dry_run=true to preview without writing to DB.
     Returns detailed report.
     """
     from app.services.auto_approve_service import run_auto_approve
-    return await run_auto_approve(session, project_id)
+    return await run_auto_approve(session, project_id, dry_run=dry_run)
 
 
 @router.get("/export-profiles", response_model=list[ExportProfileRead])
