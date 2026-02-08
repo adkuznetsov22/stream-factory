@@ -83,6 +83,60 @@ class StepContext:
 StepHandler = Callable[[StepContext, dict], Awaitable[dict]]
 
 
+# ── Tool categories for semaphores & timeouts ──────────────
+WHISPER_TOOLS = {"T08_SPEECH_TO_TEXT"}
+FFMPEG_TOOLS = {"T03_NORMALIZE", "T04_CROP_RESIZE", "T14_BURN_CAPTIONS", "T15_EFFECTS", "T17_PACKAGE"}
+
+
+def _get_step_timeout(tool_id: str) -> int:
+    """Get timeout in seconds for a given tool."""
+    from app.settings import get_settings
+    s = get_settings()
+    if tool_id in WHISPER_TOOLS:
+        return s.pipeline_whisper_timeout_sec
+    if tool_id in FFMPEG_TOOLS:
+        return s.pipeline_ffmpeg_timeout_sec
+    return s.pipeline_default_step_timeout_sec
+
+
+async def _run_with_timeout(coro, timeout_sec: int, *, tool_id: str):
+    """Run a coroutine with a timeout. Raises RuntimeError on timeout."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"{tool_id}: timeout after {timeout_sec}s")
+
+
+async def _run_with_semaphore_and_timeout(
+    coro_factory,
+    tool_id: str,
+    sem_name: str,
+    sem_limit: int,
+    timeout_sec: int,
+    log_cb=None,
+):
+    """Acquire semaphore, run coroutine with timeout, release semaphore."""
+    from app.services import redis_semaphore
+    from app.settings import get_settings
+    s = get_settings()
+
+    token = None
+    try:
+        if log_cb:
+            log_cb(f"[{tool_id}] Waiting for '{sem_name}' semaphore (limit={sem_limit})...")
+        token = await redis_semaphore.acquire(
+            sem_name, sem_limit,
+            ttl_sec=s.redis_semaphore_ttl_sec,
+            wait_timeout_sec=s.semaphore_wait_timeout_sec,
+        )
+        if log_cb:
+            log_cb(f"[{tool_id}] Acquired '{sem_name}' slot, running (timeout={timeout_sec}s)")
+        return await _run_with_timeout(coro_factory(), timeout_sec, tool_id=tool_id)
+    finally:
+        if token:
+            await redis_semaphore.release(sem_name, token)
+
+
 class PipelineExecutor:
     """Executes pipeline steps for video processing."""
     
@@ -171,7 +225,29 @@ class PipelineExecutor:
             
             try:
                 self.context.log(f"[{tool_id}] Starting step: {name}")
-                outputs = await handler(self.context, params)
+
+                # Wrap heavy tools with semaphore + timeout
+                from app.settings import get_settings
+                _s = get_settings()
+                timeout_sec = _get_step_timeout(tool_id)
+
+                if tool_id in WHISPER_TOOLS:
+                    outputs = await _run_with_semaphore_and_timeout(
+                        lambda: handler(self.context, params),
+                        tool_id, "whisper", _s.max_whisper_concurrency,
+                        timeout_sec, log_cb=self.context.log,
+                    )
+                elif tool_id in FFMPEG_TOOLS:
+                    outputs = await _run_with_semaphore_and_timeout(
+                        lambda: handler(self.context, params),
+                        tool_id, "ffmpeg", _s.max_ffmpeg_concurrency,
+                        timeout_sec, log_cb=self.context.log,
+                    )
+                else:
+                    outputs = await _run_with_timeout(
+                        handler(self.context, params),
+                        timeout_sec, tool_id=tool_id,
+                    )
                 
                 duration_ms = int((datetime.now(timezone.utc) - t_start).total_seconds() * 1000)
                 step_result["status"] = "ok"

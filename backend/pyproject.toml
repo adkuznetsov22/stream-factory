@@ -20,6 +20,7 @@ dependencies = [
     "edge-tts>=6.1.9",
     "deep-translator>=1.11.4",
     "celery[redis]>=5.3.0",
+    "redis>=5.0.0",
 ]
 
 [build-system]
