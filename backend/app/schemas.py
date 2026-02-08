@@ -114,6 +114,7 @@ class ExportProfileRead(BaseModel):
     name: str
     target_platform: str
     max_duration_sec: int
+    recommended_duration_sec: int
     width: int
     height: int
     fps: int

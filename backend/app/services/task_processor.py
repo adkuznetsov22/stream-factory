@@ -110,6 +110,7 @@ class TaskProcessor:
                     "name": ep.name,
                     "target_platform": ep.target_platform,
                     "max_duration_sec": ep.max_duration_sec,
+                    "recommended_duration_sec": ep.recommended_duration_sec,
                     "width": ep.width,
                     "height": ep.height,
                     "fps": ep.fps,

@@ -1580,7 +1580,9 @@ async def handle_generate_script(ctx: StepContext, params: dict) -> dict:
     tone = brief.get("tone") or params.get("tone", "casual")
     target_duration = (
         brief.get("target_duration_sec")
-        or params.get("target_duration_sec", 60)
+        or params.get("target_duration_sec")
+        or ctx.export_profile.get("recommended_duration_sec")
+        or 60
     )
     keywords = meta.get("keywords") or params.get("keywords", [])
     language = brief.get("language") or params.get("language", "ru")
