@@ -1405,9 +1405,76 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
 
     actions = {
         "can_process": task.status in {"queued", "error"},
+        "can_process_v2": task.status in {"queued", "error", "done"},
+        "can_retry_publish": bool(
+            task.status in {"done", "error", "published"}
+            and (artifacts.get("ready_video_path") or artifacts.get("final_video_path"))
+        ),
         "can_mark_done": task.status not in {"done", "completed"},
         "can_mark_error": task.status != "error",
     }
+
+    # Publish info
+    publish_info = {
+        "published_url": task.published_url,
+        "published_external_id": task.published_external_id,
+        "published_at": task.published_at.isoformat() if task.published_at else None,
+        "publish_error": task.publish_error,
+        "last_metrics_json": task.last_metrics_json,
+        "last_metrics_at": task.last_metrics_at.isoformat() if task.last_metrics_at else None,
+    }
+
+    # Candidate info
+    candidate_info = None
+    from app.models import Candidate
+    cand_q = await session.execute(
+        select(Candidate).where(Candidate.linked_publish_task_id == task.id)
+    )
+    cand = cand_q.scalar_one_or_none()
+    if cand:
+        candidate_info = {
+            "id": cand.id,
+            "title": cand.title,
+            "author": cand.author,
+            "platform": cand.platform,
+            "url": cand.url,
+            "origin": cand.origin,
+            "virality_score": cand.virality_score,
+            "virality_factors": cand.virality_factors,
+            "views": cand.views,
+            "likes": cand.likes,
+            "comments": cand.comments,
+            "shares": cand.shares,
+            "brief_id": cand.brief_id,
+            "meta": cand.meta,
+        }
+
+    # Step results from DB (enriched)
+    step_results_data = []
+    from app.models import StepResult
+    sr_q = await session.execute(
+        select(StepResult)
+        .where(StepResult.task_id == task.id)
+        .order_by(StepResult.step_index, StepResult.version.desc())
+    )
+    for sr in sr_q.scalars().all():
+        step_results_data.append({
+            "id": sr.id,
+            "step_index": sr.step_index,
+            "tool_id": sr.tool_id,
+            "step_name": sr.step_name,
+            "status": sr.status,
+            "started_at": sr.started_at.isoformat() if sr.started_at else None,
+            "completed_at": sr.completed_at.isoformat() if sr.completed_at else None,
+            "duration_ms": sr.duration_ms,
+            "output_data": sr.output_data,
+            "output_files": sr.output_files,
+            "error_message": sr.error_message,
+            "logs": sr.logs[:2000] if sr.logs else None,
+            "moderation_status": sr.moderation_status,
+            "retry_count": sr.retry_count,
+            "version": sr.version,
+        })
 
     response = {
         "task": {
@@ -1422,6 +1489,7 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
             "preset_name": preset.name if preset else None,
             "external_id": task.external_id,
             "permalink": task.permalink,
+            "caption_text": task.caption_text,
             "created_at": task.created_at.isoformat() if task.created_at else None,
             "updated_at": task.updated_at.isoformat() if task.updated_at else None,
         },
@@ -1429,6 +1497,9 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
         "pipeline": {"summary": summary, "steps": steps_ui},
         "files": files,
         "actions": actions,
+        "publish": publish_info,
+        "candidate": candidate_info,
+        "step_results": step_results_data,
     }
     return response
 
@@ -1601,6 +1672,39 @@ async def publish_task(task_id: int, session: AsyncSession = SessionDep):
     """
     from app.services.auto_publisher import auto_publisher
     
+    result = await auto_publisher.publish_task(session, task_id)
+    return result
+
+
+@router.post("/publish-tasks/{task_id}/retry-publish", response_model=dict)
+async def retry_publish_task(task_id: int, session: AsyncSession = SessionDep):
+    """
+    Retry only the publish step (P01_PUBLISH) for a task.
+
+    Checks that ready.mp4 or final.mp4 exists, clears any previous
+    publish error, and runs only the publish handler.
+    """
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    artifacts = task.artifacts or {}
+    video_path = artifacts.get("final_video_path") or artifacts.get("ready_video_path")
+    if not video_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No ready or final video found — run full pipeline first",
+        )
+
+    # Clear previous publish state
+    task.publish_error = None
+    task.published_url = None
+    task.published_external_id = None
+    task.published_at = None
+    session.add(task)
+    await session.commit()
+
+    from app.services.auto_publisher import auto_publisher
     result = await auto_publisher.publish_task(session, task_id)
     return result
 

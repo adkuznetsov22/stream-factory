@@ -35,16 +35,66 @@ type UiTask = {
   preset_name?: string | null;
   external_id?: string | null;
   permalink?: string | null;
+  caption_text?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
 };
-type UiActions = { can_process: boolean; can_mark_done: boolean; can_mark_error: boolean };
+type UiActions = { can_process: boolean; can_process_v2: boolean; can_retry_publish: boolean; can_mark_done: boolean; can_mark_error: boolean };
+type PublishInfo = {
+  published_url?: string | null;
+  published_external_id?: string | null;
+  published_at?: string | null;
+  publish_error?: string | null;
+  last_metrics_json?: Record<string, number> | null;
+  last_metrics_at?: string | null;
+};
+type CandidateInfo = {
+  id: number;
+  title?: string | null;
+  author?: string | null;
+  platform: string;
+  url?: string | null;
+  origin: string;
+  virality_score?: number | null;
+  virality_factors?: Record<string, number> | null;
+  views?: number | null;
+  likes?: number | null;
+  comments?: number | null;
+  shares?: number | null;
+  brief_id?: number | null;
+  meta?: Record<string, unknown> | null;
+};
+type StepResultItem = {
+  id: number;
+  step_index: number;
+  tool_id: string;
+  step_name?: string | null;
+  status: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  output_data?: Record<string, unknown> | null;
+  output_files?: string[] | null;
+  error_message?: string | null;
+  logs?: string | null;
+  moderation_status: string;
+  retry_count: number;
+  version: number;
+};
+type MetricSnapshot = {
+  id: number; task_id: number; platform: string;
+  views: number; likes: number; comments: number; shares?: number | null;
+  snapshot_at: string; hours_since_publish?: number | null;
+};
 type UiResponse = {
   task: UiTask;
   result: { preview: UiResultBlock; final: UiResultBlock; ready: UiResultBlock; raw: UiResultBlock; thumb: UiResultBlock };
   pipeline: UiPipeline;
   files: { video: UiFileItem[]; preview: UiFileItem[]; subtitles: UiFileItem[]; technical: UiFileItem[] };
   actions: UiActions;
+  publish: PublishInfo;
+  candidate?: CandidateInfo | null;
+  step_results: StepResultItem[];
 };
 
 const FILTERED_PATTERNS = [
@@ -69,6 +119,9 @@ export default function TaskDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  const [metrics, setMetrics] = useState<MetricSnapshot[]>([]);
+  const [expandedStepResult, setExpandedStepResult] = useState<number | null>(null);
 
   const [logTail, setLogTail] = useState<string>("");
   const [tailSize, setTailSize] = useState<number>(200);
@@ -114,9 +167,18 @@ export default function TaskDetailPage() {
     }
   };
 
+  const loadMetrics = async () => {
+    if (!taskId) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/metrics`);
+      if (res.ok) setMetrics(await res.json());
+    } catch { /* ignore */ }
+  };
+
   useEffect(() => {
     fetchData();
     loadLog(tailSize);
+    loadMetrics();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId]);
 
@@ -275,6 +337,31 @@ export default function TaskDetailPage() {
     await loadLog(tailSize);
   };
 
+  const handleProcessV2 = async () => {
+    if (!taskId) return;
+    setActionError(null);
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/process-v2`, { method: "POST" });
+    if (!res.ok) {
+      setActionError("Не удалось запустить Process v2");
+      return;
+    }
+    await fetchData();
+    await loadLog(tailSize);
+  };
+
+  const handleRetryPublish = async () => {
+    if (!taskId) return;
+    setActionError(null);
+    const res = await fetch(`${API_BASE}/api/publish-tasks/${taskId}/retry-publish`, { method: "POST" });
+    if (!res.ok) {
+      const text = await res.text();
+      setActionError(`Не удалось опубликовать: ${text}`);
+      return;
+    }
+    await fetchData();
+    await loadMetrics();
+  };
+
   const handleStatusUpdate = async (status: string, reason?: string) => {
     if (!taskId) return;
     setActionError(null);
@@ -306,21 +393,31 @@ export default function TaskDetailPage() {
                 Назад
               </button>
               <button style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "var(--accent)", color: "#fff", fontWeight: 600, cursor: "pointer" }} onClick={handleProcess} disabled={!(data?.actions?.can_process ?? true)}>
-                Обработать заново
+                Обработать
+              </button>
+              <button style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#7c3aed", color: "#fff", fontWeight: 600, cursor: "pointer" }} onClick={handleProcessV2} disabled={!(data?.actions?.can_process_v2 ?? true)}>
+                Process v2
+              </button>
+              <button
+                style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#0ea5e9", color: "#fff", fontWeight: 600, cursor: "pointer", opacity: data?.actions?.can_retry_publish ? 1 : 0.4 }}
+                onClick={handleRetryPublish}
+                disabled={!(data?.actions?.can_retry_publish ?? false)}
+              >
+                Retry Publish
               </button>
               <button
                 style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#d1fae5", color: "#065f46", cursor: "pointer" }}
                 onClick={() => handleStatusUpdate("done")}
                 disabled={!(data?.actions?.can_mark_done ?? true)}
               >
-                Пометить как готово
+                Готово
               </button>
               <button
                 style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#fee2e2", color: "#991b1b", cursor: "pointer" }}
                 onClick={() => handleStatusUpdate("error", "Ошибка оператора")}
                 disabled={!(data?.actions?.can_mark_error ?? true)}
               >
-                Пометить как ошибку
+                Ошибка
               </button>
             </div>
           </div>
@@ -404,7 +501,188 @@ export default function TaskDetailPage() {
               </div>
             </div>
 
-            {/* Шаги */}
+            {/* Publish Info + Candidate */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              {/* Publish Status */}
+              <div style={{ background: "var(--bg-secondary)", borderRadius: 12, border: "1px solid var(--border-primary)", padding: 16 }}>
+                <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>Публикация</div>
+                {data.publish.published_url ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ background: "#dcfce7", color: "#166534", padding: "2px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600 }}>Опубликовано</span>
+                      {data.publish.published_at && (
+                        <span style={{ fontSize: 12, color: "#64748b" }}>{new Date(data.publish.published_at).toLocaleString("ru")}</span>
+                      )}
+                    </div>
+                    <a href={data.publish.published_url} target="_blank" rel="noreferrer" style={{ color: "#2563eb", fontSize: 13, textDecoration: "underline", wordBreak: "break-all" }}>
+                      {data.publish.published_url}
+                    </a>
+                    {data.publish.published_external_id && (
+                      <div style={{ fontSize: 12, color: "#64748b" }}>External ID: {data.publish.published_external_id}</div>
+                    )}
+                    {data.publish.last_metrics_json && (
+                      <div style={{ display: "flex", gap: 12, marginTop: 4, fontSize: 12 }}>
+                        {Object.entries(data.publish.last_metrics_json).map(([k, v]) => (
+                          <span key={k}><strong>{k}:</strong> {typeof v === "number" ? v.toLocaleString() : String(v)}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : data.publish.publish_error ? (
+                  <div>
+                    <span style={{ background: "#fee2e2", color: "#991b1b", padding: "2px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600 }}>Ошибка</span>
+                    <div style={{ marginTop: 6, fontSize: 13, color: "#991b1b", background: "#fee2e2", padding: 8, borderRadius: 8 }}>
+                      {data.publish.publish_error}
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ color: "#94a3b8", fontSize: 13 }}>Не опубликовано</div>
+                )}
+              </div>
+
+              {/* Candidate Info */}
+              <div style={{ background: "var(--bg-secondary)", borderRadius: 12, border: "1px solid var(--border-primary)", padding: 16 }}>
+                <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>Кандидат</div>
+                {data.candidate ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 13 }}>
+                    <div style={{ fontWeight: 600 }}>{data.candidate.title || `#${data.candidate.id}`}</div>
+                    <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                      <span style={{ padding: "2px 8px", borderRadius: 10, background: "#dbeafe", color: "#1d4ed8", fontSize: 11, fontWeight: 600 }}>{data.candidate.platform}</span>
+                      <span style={{ padding: "2px 8px", borderRadius: 10, background: "#f3e8ff", color: "#7c3aed", fontSize: 11, fontWeight: 600 }}>{data.candidate.origin}</span>
+                      {data.candidate.virality_score != null && (
+                        <span style={{ padding: "2px 8px", borderRadius: 10, background: "#fef3c7", color: "#92400e", fontSize: 11, fontWeight: 600 }}>
+                          Score: {data.candidate.virality_score.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+                    {data.candidate.author && <div style={{ color: "#64748b" }}>Автор: {data.candidate.author}</div>}
+                    {data.candidate.url && (
+                      <a href={data.candidate.url} target="_blank" rel="noreferrer" style={{ color: "#2563eb", fontSize: 12, textDecoration: "underline" }}>
+                        Оригинал
+                      </a>
+                    )}
+                    <div style={{ display: "flex", gap: 12, color: "#64748b", fontSize: 12 }}>
+                      {data.candidate.views != null && <span>Views: {data.candidate.views.toLocaleString()}</span>}
+                      {data.candidate.likes != null && <span>Likes: {data.candidate.likes.toLocaleString()}</span>}
+                      {data.candidate.comments != null && <span>Comments: {data.candidate.comments.toLocaleString()}</span>}
+                    </div>
+                    {data.candidate.virality_factors && (
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+                        {Object.entries(data.candidate.virality_factors).filter(([k]) => ["velocity", "engagement", "recency", "sub_ratio"].includes(k)).map(([k, v]) => (
+                          <div key={k} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}>
+                            <span style={{ color: "#64748b" }}>{k}:</span>
+                            <div style={{ width: 40, height: 4, background: "#e2e8f0", borderRadius: 2 }}>
+                              <div style={{ width: `${Math.min(100, (v as number))}%`, height: "100%", background: (v as number) > 50 ? "#22c55e" : "#eab308", borderRadius: 2 }} />
+                            </div>
+                            <span style={{ fontWeight: 600 }}>{(v as number).toFixed(0)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ color: "#94a3b8", fontSize: 13 }}>Нет связанного кандидата</div>
+                )}
+              </div>
+            </div>
+
+            {/* Metrics */}
+            {metrics.length > 0 && (
+              <div style={{ background: "var(--bg-secondary)", borderRadius: 12, border: "1px solid var(--border-primary)", padding: 16 }}>
+                <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>Метрики ({metrics.length} снимков)</div>
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                    <thead>
+                      <tr style={{ borderBottom: "2px solid #e2e8f0", textAlign: "left" }}>
+                        <th style={{ padding: "6px 8px", fontWeight: 600 }}>Время</th>
+                        <th style={{ padding: "6px 8px", fontWeight: 600, textAlign: "right" }}>Часы</th>
+                        <th style={{ padding: "6px 8px", fontWeight: 600, textAlign: "right" }}>Views</th>
+                        <th style={{ padding: "6px 8px", fontWeight: 600, textAlign: "right" }}>Likes</th>
+                        <th style={{ padding: "6px 8px", fontWeight: 600, textAlign: "right" }}>Comments</th>
+                        <th style={{ padding: "6px 8px", fontWeight: 600, textAlign: "right" }}>Shares</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {metrics.map((m, i) => {
+                        const prev = i > 0 ? metrics[i - 1] : null;
+                        const delta = prev ? m.views - prev.views : 0;
+                        return (
+                          <tr key={m.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                            <td style={{ padding: "6px 8px", color: "#64748b" }}>{new Date(m.snapshot_at).toLocaleString("ru", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right", color: "#64748b" }}>{m.hours_since_publish != null ? `${m.hours_since_publish.toFixed(0)}h` : "—"}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right", fontWeight: 600 }}>
+                              {m.views.toLocaleString()}
+                              {delta > 0 && <span style={{ color: "#22c55e", fontSize: 11, marginLeft: 4 }}>+{delta.toLocaleString()}</span>}
+                            </td>
+                            <td style={{ padding: "6px 8px", textAlign: "right" }}>{m.likes.toLocaleString()}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right" }}>{m.comments.toLocaleString()}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right" }}>{m.shares != null ? m.shares.toLocaleString() : "—"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Step Results (DB-based, collapsible) */}
+            {data.step_results && data.step_results.length > 0 && (
+              <div style={{ background: "var(--bg-secondary)", borderRadius: 12, border: "1px solid var(--border-primary)", padding: 16 }}>
+                <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>Step Results (DB)</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {data.step_results.map((sr) => {
+                    const isOpen = expandedStepResult === sr.id;
+                    const color = sr.status === "completed" || sr.status === "ok" ? "#16a34a" : sr.status === "error" ? "#dc2626" : sr.status === "running" ? "#2563eb" : "#94a3b8";
+                    return (
+                      <div key={sr.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8 }}>
+                        <div
+                          onClick={() => setExpandedStepResult(isOpen ? null : sr.id)}
+                          style={{ padding: "8px 12px", cursor: "pointer", display: "grid", gridTemplateColumns: "32px 120px 1fr 80px 60px", alignItems: "center", gap: 8, fontSize: 13 }}
+                        >
+                          <span style={{ color: "#94a3b8" }}>{sr.step_index}</span>
+                          <span style={{ color, fontWeight: 600 }}>{sr.status}</span>
+                          <span style={{ fontWeight: 500 }}>{sr.step_name || sr.tool_id}</span>
+                          <span style={{ color: "#64748b", textAlign: "right" }}>{sr.duration_ms != null ? `${(sr.duration_ms / 1000).toFixed(1)}s` : "—"}</span>
+                          <span style={{ color: "#94a3b8", textAlign: "right" }}>{isOpen ? "▲" : "▼"}</span>
+                        </div>
+                        {isOpen && (
+                          <div style={{ padding: "0 12px 12px", display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
+                            {sr.error_message && (
+                              <div style={{ background: "#fee2e2", color: "#991b1b", padding: 8, borderRadius: 6 }}>{sr.error_message}</div>
+                            )}
+                            {sr.output_data && Object.keys(sr.output_data).length > 0 && (
+                              <div>
+                                <div style={{ fontWeight: 600, marginBottom: 4 }}>Output Data:</div>
+                                <pre style={{ background: "#f1f5f9", padding: 8, borderRadius: 6, overflow: "auto", maxHeight: 200, fontSize: 11 }}>
+                                  {JSON.stringify(sr.output_data, null, 2)}
+                                </pre>
+                              </div>
+                            )}
+                            {sr.logs && (
+                              <div>
+                                <div style={{ fontWeight: 600, marginBottom: 4 }}>Logs:</div>
+                                <pre style={{ background: "#0f172a", color: "#e2e8f0", padding: 8, borderRadius: 6, overflow: "auto", maxHeight: 200, fontSize: 11, whiteSpace: "pre-wrap" }}>
+                                  {sr.logs}
+                                </pre>
+                              </div>
+                            )}
+                            <div style={{ display: "flex", gap: 12, color: "#64748b" }}>
+                              <span>v{sr.version}</span>
+                              {sr.retry_count > 0 && <span>Retries: {sr.retry_count}</span>}
+                              <span>Moderation: {sr.moderation_status}</span>
+                              {sr.started_at && <span>Start: {new Date(sr.started_at).toLocaleTimeString("ru")}</span>}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Шаги (pipeline) */}
             <div style={{ background: "var(--bg-secondary)", borderRadius: 12, border: "1px solid var(--border-primary)", padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
               <div style={{ display: "flex", gap: 12, fontSize: 14, color: "#475569", flexWrap: "wrap" }}>
                 <span>Всего: {data.pipeline.summary.total}</span>
