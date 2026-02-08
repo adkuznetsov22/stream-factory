@@ -115,6 +115,17 @@ async def sync_published_metrics(session: AsyncSession) -> dict:
                     },
                 )
                 await session.execute(stmt)
+
+                # Update denormalized last_metrics cache on PublishTask
+                task.last_metrics_json = {
+                    "views": metrics.get("views"),
+                    "likes": metrics.get("likes"),
+                    "comments": metrics.get("comments"),
+                    "shares": metrics.get("shares"),
+                    "hours_since_publish": hours_since,
+                }
+                task.last_metrics_at = now
+                session.add(task)
                 synced += 1
 
             await session.commit()

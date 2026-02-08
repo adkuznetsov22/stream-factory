@@ -556,6 +556,8 @@ class PublishTask(Base):
     published_external_id: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     publish_error: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    last_metrics_json: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    last_metrics_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     # Moderation fields
     moderation_mode: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default="manual")
     require_final_approval: Mapped[bool] = mapped_column(sa.Boolean(), nullable=False, server_default=sa.true())

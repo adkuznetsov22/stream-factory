@@ -236,6 +236,8 @@ class PublishTaskRead(BaseModel):
     published_external_id: str | None = None
     published_at: datetime | None = None
     publish_error: str | None = None
+    last_metrics_json: dict | None = None
+    last_metrics_at: datetime | None = None
     # Moderation fields
     moderation_mode: str = "manual"
     require_final_approval: bool = True
