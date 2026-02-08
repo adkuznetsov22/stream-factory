@@ -229,6 +229,11 @@ class PublishTaskRead(BaseModel):
     preset_id: int | None = None
     artifacts: dict | None = None
     dag_debug: dict | None = None
+    # Publishing result
+    published_url: str | None = None
+    published_external_id: str | None = None
+    published_at: datetime | None = None
+    publish_error: str | None = None
     # Moderation fields
     moderation_mode: str = "manual"
     require_final_approval: bool = True

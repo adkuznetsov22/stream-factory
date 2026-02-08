@@ -549,6 +549,11 @@ class PublishTask(Base):
     preset_id: Mapped[int | None] = mapped_column(sa.Integer(), nullable=True)
     artifacts: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
     dag_debug: Mapped[dict | None] = mapped_column(sa.JSON(), nullable=True)
+    # Publishing result
+    published_url: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    published_external_id: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    publish_error: Mapped[str | None] = mapped_column(sa.Text(), nullable=True)
     # Moderation fields
     moderation_mode: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default="manual")
     require_final_approval: Mapped[bool] = mapped_column(sa.Boolean(), nullable=False, server_default=sa.true())

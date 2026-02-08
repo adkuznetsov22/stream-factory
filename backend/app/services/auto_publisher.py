@@ -1,195 +1,218 @@
 """
 Auto-publishing service for completed tasks.
-Handles automatic posting of processed videos to destination platforms.
-"""
 
-import asyncio
+Uses PublisherAdapter layer for platform-specific uploads.
+All results (success and error) are saved explicitly into
+PublishTask fields and StepResult — no silent failures.
+"""
+from __future__ import annotations
+
 import logging
-from datetime import datetime
-from typing import Optional
+import os
+from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import PublishTask, Project, SocialAccount
+from ..models import PublishTask, Project, SocialAccount, StepResult
+from .publisher_adapter import get_publisher, PublishResult
 from .telegram_notifier import notify_task_completed, notify_task_error
 
 logger = logging.getLogger(__name__)
 
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+TASKS_DIR = DATA_DIR / "tasks"
+
 
 class AutoPublisher:
     """
-    Service to automatically publish completed videos to platforms.
-    This is a placeholder implementation - actual platform APIs would need
-    to be integrated for real publishing.
+    Publishes completed videos via platform-specific adapters.
+    Saves published_url, published_external_id, publish_error into PublishTask.
+    Logs errors into StepResult for traceability.
     """
-    
+
     async def publish_task(
         self,
         session: AsyncSession,
         task_id: int,
     ) -> dict:
-        """
-        Publish a completed task to its destination platform.
-        
-        Returns:
-            dict with status and optional permalink/error
-        """
-        # Get task
-        query = select(PublishTask).where(PublishTask.id == task_id)
-        result = await session.execute(query)
-        task = result.scalars().first()
-        
+        """Publish a completed task to its destination platform."""
+        task = await session.get(PublishTask, task_id)
         if not task:
             return {"status": "error", "error": "Task not found"}
-        
+
         if task.status != "done":
             return {"status": "error", "error": f"Task not ready for publishing: {task.status}"}
-        
-        # Get destination account
-        acc_query = select(SocialAccount).where(SocialAccount.id == task.destination_social_account_id)
-        acc_result = await session.execute(acc_query)
-        account = acc_result.scalars().first()
-        
+
+        account = await session.get(SocialAccount, task.destination_social_account_id)
         if not account:
             return {"status": "error", "error": "Destination account not found"}
-        
-        # Get project for notifications
-        proj_query = select(Project).where(Project.id == task.project_id)
-        proj_result = await session.execute(proj_query)
-        project = proj_result.scalars().first()
+
+        project = await session.get(Project, task.project_id)
         project_name = project.name if project else f"Project #{task.project_id}"
-        
+
+        platform = task.platform.lower()
+        adapter = get_publisher(platform)
+        if not adapter:
+            err = f"Unsupported platform: {platform}"
+            await self._save_error(session, task, project_name, err)
+            return {"status": "error", "error": err}
+
+        # Resolve output file
+        file_path = self._resolve_output_file(task)
+        if not file_path or not file_path.exists():
+            err = f"Output video not found at {file_path}"
+            await self._save_error(session, task, project_name, err)
+            return {"status": "error", "error": err}
+
+        # Prepare metadata
+        title = task.caption_text or task.instructions or f"Video #{task.id}"
+        description = task.caption_text or ""
+        tags = self._extract_tags(task)
+
+        logger.info(f"[publish] task={task.id} platform={platform} file={file_path}")
+
         try:
-            # Platform-specific publishing
-            platform = task.platform.lower()
-            
-            if platform == "youtube":
-                result = await self._publish_youtube(task, account)
-            elif platform == "tiktok":
-                result = await self._publish_tiktok(task, account)
-            elif platform == "instagram":
-                result = await self._publish_instagram(task, account)
-            elif platform == "vk":
-                result = await self._publish_vk(task, account)
-            else:
-                result = {"status": "error", "error": f"Unsupported platform: {platform}"}
-            
-            if result.get("status") == "published":
-                task.status = "published"
-                task.permalink = result.get("permalink")
-                task.published_at = datetime.utcnow()
-                await session.commit()
-                
-                await notify_task_completed(
-                    task_id=task.id,
-                    project_name=project_name,
-                    platform=platform,
-                )
-            else:
-                task.status = "error"
-                task.error_message = result.get("error", "Publishing failed")
-                await session.commit()
-                
-                await notify_task_error(
-                    task_id=task.id,
-                    project_name=project_name,
-                    platform=platform,
-                    error_message=result.get("error"),
-                )
-            
-            return result
-            
-        except Exception as e:
-            logger.exception(f"Error publishing task {task_id}")
-            task.status = "error"
-            task.error_message = str(e)
+            result: PublishResult = await adapter.publish(
+                task=task,
+                account=account,
+                file_path=file_path,
+                title=title,
+                description=description,
+                tags=tags,
+            )
+        except Exception as exc:
+            logger.exception(f"[publish] Unhandled error for task {task_id}")
+            result = PublishResult(
+                success=False,
+                platform=platform,
+                error=f"Unhandled exception: {exc}",
+            )
+
+        # Persist result
+        now = datetime.now(timezone.utc)
+
+        if result.success:
+            task.status = "published"
+            task.published_url = result.url
+            task.published_external_id = result.external_id
+            task.published_at = now
+            task.publish_error = None
+            session.add(task)
             await session.commit()
-            
-            await notify_task_error(
+
+            # Save StepResult for publish step
+            await self._save_step_result(
+                session, task,
+                status="done",
+                output_data=result.to_dict(),
+            )
+
+            await notify_task_completed(
                 task_id=task.id,
                 project_name=project_name,
-                platform=task.platform,
-                error_message=str(e),
+                platform=platform,
             )
-            
-            return {"status": "error", "error": str(e)}
-    
-    async def _publish_youtube(self, task: PublishTask, account: SocialAccount) -> dict:
-        """
-        Publish to YouTube.
-        Requires YouTube Data API v3 with upload scope.
-        """
-        # TODO: Implement actual YouTube upload
-        # Would need:
-        # 1. OAuth2 credentials for the account
-        # 2. google-api-python-client
-        # 3. Upload via youtube.videos().insert()
-        
-        logger.info(f"YouTube publishing not implemented for task {task.id}")
-        return {
-            "status": "error",
-            "error": "YouTube auto-publishing not yet implemented. Please upload manually.",
-        }
-    
-    async def _publish_tiktok(self, task: PublishTask, account: SocialAccount) -> dict:
-        """
-        Publish to TikTok.
-        Requires TikTok API access (limited availability).
-        """
-        # TODO: Implement TikTok upload
-        # TikTok's API for posting is very restricted
-        
-        logger.info(f"TikTok publishing not implemented for task {task.id}")
-        return {
-            "status": "error",
-            "error": "TikTok auto-publishing not yet implemented. Please upload manually.",
-        }
-    
-    async def _publish_instagram(self, task: PublishTask, account: SocialAccount) -> dict:
-        """
-        Publish to Instagram.
-        Requires Instagram Graph API (Business/Creator accounts only).
-        """
-        # TODO: Implement Instagram upload
-        # Requires:
-        # 1. Facebook Business account
-        # 2. Instagram Graph API access
-        # 3. Container creation -> publish flow
-        
-        logger.info(f"Instagram publishing not implemented for task {task.id}")
-        return {
-            "status": "error",
-            "error": "Instagram auto-publishing not yet implemented. Please upload manually.",
-        }
-    
-    async def _publish_vk(self, task: PublishTask, account: SocialAccount) -> dict:
-        """
-        Publish to VK.
-        Uses VK API video.save + upload.
-        """
-        # TODO: Implement VK upload
-        # Would need:
-        # 1. VK access token with video scope
-        # 2. video.save to get upload URL
-        # 3. Upload video file
-        # 4. Confirm upload
-        
-        logger.info(f"VK publishing not implemented for task {task.id}")
-        return {
-            "status": "error",
-            "error": "VK auto-publishing not yet implemented. Please upload manually.",
-        }
-    
+
+            return {
+                "status": "published",
+                "published_url": result.url,
+                "external_id": result.external_id,
+                "platform": result.platform,
+            }
+        else:
+            await self._save_error(
+                session, task, project_name,
+                result.error or "Publishing failed",
+                result=result,
+            )
+            return {"status": "error", "error": result.error}
+
+    async def _save_error(
+        self,
+        session: AsyncSession,
+        task: PublishTask,
+        project_name: str,
+        error_msg: str,
+        result: PublishResult | None = None,
+    ):
+        """Persist error into task + StepResult + notify."""
+        task.status = "error"
+        task.publish_error = error_msg
+        task.error_message = error_msg
+        session.add(task)
+        await session.commit()
+
+        await self._save_step_result(
+            session, task,
+            status="error",
+            error_message=error_msg,
+            output_data=result.to_dict() if result else {"error": error_msg},
+        )
+
+        await notify_task_error(
+            task_id=task.id,
+            project_name=project_name,
+            platform=task.platform,
+            error_message=error_msg,
+        )
+
+    async def _save_step_result(
+        self,
+        session: AsyncSession,
+        task: PublishTask,
+        *,
+        status: str,
+        output_data: dict | None = None,
+        error_message: str | None = None,
+    ):
+        """Create a StepResult record for the publish step."""
+        now = datetime.now(timezone.utc)
+        step = StepResult(
+            task_id=task.id,
+            step_index=9999,  # publish — виртуальный шаг после всех pipeline steps
+            tool_id="PUBLISH",
+            step_name="Platform publish",
+            status=status,
+            started_at=now,
+            completed_at=now,
+            output_data=output_data,
+            error_message=error_message,
+            moderation_status="auto_approved",
+            can_retry=True,
+        )
+        session.add(step)
+        await session.commit()
+
+    def _resolve_output_file(self, task: PublishTask) -> Path | None:
+        """Find the final output video for a task."""
+        task_dir = TASKS_DIR / str(task.id)
+        # Prefer final.mp4, then ready.mp4
+        for name in ("final.mp4", "ready.mp4", "output.mp4"):
+            p = task_dir / name
+            if p.exists():
+                return p
+        # Check artifacts for explicit path
+        if task.artifacts and isinstance(task.artifacts, dict):
+            path_str = task.artifacts.get("output_path") or task.artifacts.get("final_path")
+            if path_str:
+                p = Path(path_str)
+                if p.exists():
+                    return p
+        return None
+
+    def _extract_tags(self, task: PublishTask) -> list[str]:
+        """Extract hashtags / tags from task metadata."""
+        tags: list[str] = []
+        if task.artifacts and isinstance(task.artifacts, dict):
+            t = task.artifacts.get("tags") or task.artifacts.get("hashtags") or []
+            if isinstance(t, list):
+                tags = [str(x) for x in t]
+        return tags
+
     async def process_pending_publications(self, session: AsyncSession) -> int:
-        """
-        Process all tasks that are ready for auto-publishing.
-        Called by scheduler.
-        
-        Returns:
-            Number of tasks processed
-        """
-        # Find tasks that are done and have auto-publish enabled
+        """Process all tasks that are ready for auto-publishing. Called by scheduler."""
         query = (
             select(PublishTask)
             .join(Project, PublishTask.project_id == Project.id)
@@ -199,10 +222,10 @@ class AutoPublisher:
             ))
             .limit(10)
         )
-        
+
         result = await session.execute(query)
         tasks = result.scalars().all()
-        
+
         processed = 0
         for task in tasks:
             try:
@@ -210,7 +233,7 @@ class AutoPublisher:
                 processed += 1
             except Exception as e:
                 logger.error(f"Failed to process task {task.id}: {e}")
-        
+
         return processed
 
 
