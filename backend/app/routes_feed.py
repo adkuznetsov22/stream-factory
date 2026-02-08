@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from app.db import get_session
 from app.services.dedupe import compute_candidate_signature, find_duplicate
 from app.services.simhash import compute_text_simhash, simhash_to_hex
+from app.services.topic_guard import ensure_candidate_topic_meta
 from app.models import (
     Brief,
     Candidate,
@@ -422,6 +423,9 @@ async def _upsert_candidate(
         meta["content_simhash64"] = simhash_to_hex(sh)
         meta["content_simhash_source"] = sig_source
         candidate.meta = meta
+
+    # Extract topic tags + signature for topic anti-repeat guard
+    ensure_candidate_topic_meta(candidate)
 
     session.add(candidate)
     return candidate, is_new

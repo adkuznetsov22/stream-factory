@@ -36,6 +36,9 @@ type PublishSettings = {
   min_gap_minutes_per_destination?: number;
   daily_limit_per_destination?: number;
   jitter_minutes?: number;
+  topic_guard_enabled?: boolean;
+  topic_guard_last_n?: number;
+  topic_guard_cooldown_hours?: number;
 };
 
 type Project = {
@@ -251,6 +254,9 @@ function PublishScheduleBlock({
   const minGap = ps.min_gap_minutes_per_destination ?? 90;
   const dailyLimit = ps.daily_limit_per_destination ?? 3;
   const jitter = ps.jitter_minutes ?? 0;
+  const tgEnabled = ps.topic_guard_enabled ?? true;
+  const tgLastN = ps.topic_guard_last_n ?? 5;
+  const tgCooldown = ps.topic_guard_cooldown_hours ?? 12;
   const windows = ps.windows || {};
   const weekdayWindow = (windows.mon || [["10:00", "22:00"]])[0] || ["10:00", "22:00"];
   const weekendWindow = (windows.sat || [["12:00", "20:00"]])[0] || ["12:00", "20:00"];
@@ -309,6 +315,30 @@ function PublishScheduleBlock({
                   onChange={e => set({ jitter_minutes: Number(e.target.value) || 0 })}
                   style={{ width: "100%" }} />
               </div>
+            </div>
+
+            {/* Topic Guard */}
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, padding: "10px 12px", background: "var(--bg-subtle)", borderRadius: 8, border: "1px solid var(--border)" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flex: "0 0 auto" }}>
+                <input type="checkbox" checked={tgEnabled} onChange={e => set({ topic_guard_enabled: e.target.checked })} />
+                <span style={{ fontSize: 12, fontWeight: 500 }}>Topic Guard</span>
+              </label>
+              {tgEnabled && (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <label style={{ fontSize: 11, color: "var(--fg-subtle)", whiteSpace: "nowrap" }}>last_n</label>
+                    <input type="number" min={1} max={20} value={tgLastN}
+                      onChange={e => set({ topic_guard_last_n: Number(e.target.value) || 5 })}
+                      style={{ width: 55 }} />
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <label style={{ fontSize: 11, color: "var(--fg-subtle)", whiteSpace: "nowrap" }}>cooldown (ч)</label>
+                    <input type="number" min={1} max={168} value={tgCooldown}
+                      onChange={e => set({ topic_guard_cooldown_hours: Number(e.target.value) || 12 })}
+                      style={{ width: 55 }} />
+                  </div>
+                </>
+              )}
             </div>
 
             {/* Windows */}

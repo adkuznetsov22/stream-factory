@@ -156,6 +156,41 @@ async def run_auto_publish(
 
         active_dests = [d for d in project.destinations if d.is_active]
 
+        # ── Topic guard settings ──────────────────────────────
+        tg_enabled = ps.get("topic_guard_enabled", True)
+        tg_last_n = ps.get("topic_guard_last_n", 5)
+        tg_cooldown_hours = ps.get("topic_guard_cooldown_hours", 12)
+
+        # Build banned topic_signature sets per destination
+        banned_topic_sigs: dict[int, set[str]] = {}
+        if tg_enabled:
+            tg_cutoff = now - timedelta(hours=tg_cooldown_hours)
+            for dest in active_dests:
+                dest_id = dest.social_account_id
+                # Recent published tasks for this destination
+                recent_q = await session.execute(
+                    select(PublishTask.id).where(and_(
+                        PublishTask.project_id == project.id,
+                        PublishTask.destination_social_account_id == dest_id,
+                        PublishTask.status == "published",
+                        PublishTask.published_at >= tg_cutoff,
+                    )).order_by(PublishTask.published_at.desc()).limit(tg_last_n)
+                )
+                recent_task_ids = [r[0] for r in recent_q.all()]
+                sigs: set[str] = set()
+                if recent_task_ids:
+                    cand_sigs_q = await session.execute(
+                        select(Candidate.meta).where(
+                            Candidate.linked_publish_task_id.in_(recent_task_ids),
+                        )
+                    )
+                    for (cmeta,) in cand_sigs_q.all():
+                        if cmeta and isinstance(cmeta, dict):
+                            ts = cmeta.get("topic_signature")
+                            if ts:
+                                sigs.add(ts)
+                banned_topic_sigs[dest_id] = sigs
+
         # Count published today per destination
         daily_counts: dict[int, int] = {}
         last_published: dict[int, datetime | None] = {}
@@ -250,6 +285,26 @@ async def run_auto_publish(
                         "reason": f"min_gap: {gap:.0f}m < {min_gap_minutes}m",
                     })
                     continue
+
+            # Topic anti-repeat guard
+            if tg_enabled and dest_id in banned_topic_sigs:
+                # Get candidate's topic_signature
+                cand_for_task = task.candidate if hasattr(task, "candidate") and task.candidate else None
+                if not cand_for_task:
+                    cand_q2 = await session.execute(
+                        select(Candidate).where(Candidate.linked_publish_task_id == task.id).limit(1)
+                    )
+                    cand_for_task = cand_q2.scalar_one_or_none()
+                if cand_for_task:
+                    from app.services.topic_guard import ensure_candidate_topic_meta
+                    _, task_topic_sig = ensure_candidate_topic_meta(cand_for_task)
+                    if task_topic_sig and task_topic_sig in banned_topic_sigs[dest_id]:
+                        skipped.append({
+                            "project_id": project.id,
+                            "task_id": task.id,
+                            "reason": f"topic_repeat: sig={task_topic_sig[:12]}…",
+                        })
+                        continue
 
             if dry_run:
                 started.append({
