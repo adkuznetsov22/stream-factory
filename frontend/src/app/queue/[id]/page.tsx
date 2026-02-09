@@ -39,7 +39,7 @@ type UiTask = {
   created_at?: string | null;
   updated_at?: string | null;
 };
-type UiActions = { can_process: boolean; can_process_v2: boolean; can_retry_publish: boolean; can_mark_done: boolean; can_mark_error: boolean; can_mark_ready_for_publish: boolean; can_download: boolean };
+type UiActions = { can_process: boolean; can_process_v2: boolean; can_retry_publish: boolean; can_mark_done: boolean; can_mark_error: boolean; can_mark_ready_for_publish: boolean; can_download: boolean; can_download_package: boolean };
 type PublishInfo = {
   published_url?: string | null;
   published_external_id?: string | null;
@@ -541,6 +541,15 @@ export default function TaskDetailPage() {
                   download
                 >
                   ⬇ Download {(data as any).final_video_filename || "video"}
+                </a>
+              )}
+              {data && data.actions?.can_download_package && (
+                <a
+                  href={`${API_BASE}/api/publish-tasks/${taskId}/package`}
+                  style={{ padding: "8px 16px", borderRadius: 8, border: "none", background: "#6d28d9", color: "#fff", fontWeight: 600, cursor: "pointer", textDecoration: "none", display: "inline-block" }}
+                  download
+                >
+                  📦 Download Package
                 </a>
               )}
             </div>

@@ -1434,6 +1434,7 @@ async def get_publish_task_ui(task_id: int, session: AsyncSession = SessionDep):
         "can_mark_error": task.status != "error",
         "can_mark_ready_for_publish": task.status in {"ready_for_review", "done"} and _final_video_filename is not None,
         "can_download": _final_video_filename is not None,
+        "can_download_package": _final_video_filename is not None,
     }
 
     # Publish info
@@ -1949,6 +1950,140 @@ async def download_final_video(task_id: int, session: AsyncSession = SessionDep)
             )
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No final video file found")
+
+
+# ── Export Package (zip) ─────────────────────────────────────
+
+@router.get("/publish-tasks/{task_id}/package")
+async def download_package(task_id: int, session: AsyncSession = SessionDep):
+    """Download a zip package with final video + metadata + text files."""
+    import io
+    import json as json_mod
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    task = await session.get(PublishTask, task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    task_dir = Path(f"/data/tasks/{task_id}")
+
+    # Find final video
+    video_path: Path | None = None
+    for name in ("final.mp4", "ready.mp4"):
+        p = task_dir / name
+        if p.exists() and p.stat().st_size > 0:
+            video_path = p
+            break
+    if not video_path:
+        artifacts = task.artifacts or {}
+        for key in ("final_video_path", "ready_video_path"):
+            ap = artifacts.get(key)
+            if ap and Path(str(ap)).exists():
+                video_path = Path(str(ap))
+                break
+    if not video_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No final video file found")
+
+    # Load project
+    project = await session.scalar(select(Project).where(Project.id == task.project_id))
+
+    # Load candidate
+    from app.models import Candidate
+    cand = (await session.execute(
+        select(Candidate).where(Candidate.linked_publish_task_id == task.id)
+    )).scalar_one_or_none()
+
+    # Build metadata
+    metadata = {
+        "task_id": task.id,
+        "project_id": task.project_id,
+        "project_name": project.name if project else None,
+        "platform": task.platform,
+        "status": task.status,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "external_id": task.external_id,
+        "permalink": task.permalink,
+        "caption_text": task.caption_text,
+        "destination_account_id": task.destination_social_account_id,
+        "candidate": {
+            "id": cand.id,
+            "title": cand.title,
+            "author": cand.author,
+            "platform": cand.platform,
+            "url": cand.url,
+            "origin": cand.origin,
+            "virality_score": cand.virality_score,
+            "views": cand.views,
+            "likes": cand.likes,
+            "meta": cand.meta,
+        } if cand else None,
+        "publish_settings": (project.meta or {}).get("publish_settings") if project else None,
+        "video_file": video_path.name,
+    }
+
+    # Extract title / description / tags from candidate or task
+    title = ""
+    description = ""
+    tags = ""
+    if cand:
+        title = cand.title or ""
+        description = cand.caption or ""
+        cand_meta = cand.meta or {}
+        if cand_meta.get("tags"):
+            t = cand_meta["tags"]
+            tags = "\n".join(t) if isinstance(t, list) else str(t)
+        if cand_meta.get("hashtags"):
+            h = cand_meta["hashtags"]
+            tags += ("\n" if tags else "") + ("\n".join(h) if isinstance(h, list) else str(h))
+    if not title and task.caption_text:
+        title = task.caption_text.split("\n")[0][:200]
+    if not description and task.caption_text:
+        description = task.caption_text
+
+    # Build zip in memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Video
+        zf.write(str(video_path), video_path.name)
+
+        # metadata.json
+        zf.writestr("metadata.json", json_mod.dumps(metadata, ensure_ascii=False, indent=2, default=str))
+
+        # Text files
+        if title:
+            zf.writestr("title.txt", title)
+        if description:
+            zf.writestr("description.txt", description)
+        if tags:
+            zf.writestr("tags.txt", tags)
+
+        # Captions (srt/ass)
+        for ext in ("srt", "ass", "vtt"):
+            cap_path = task_dir / f"captions.{ext}"
+            if cap_path.exists():
+                zf.write(str(cap_path), cap_path.name)
+        artifacts = task.artifacts or {}
+        cap_art = artifacts.get("captions_path")
+        if cap_art and Path(str(cap_art)).exists() and not (task_dir / Path(str(cap_art)).name).exists():
+            zf.write(str(cap_art), Path(str(cap_art)).name)
+
+        # Script (if GENERATE origin)
+        script_path = task_dir / "script.txt"
+        if script_path.exists():
+            zf.write(str(script_path), "script.txt")
+        script_json = task_dir / "script.json"
+        if script_json.exists():
+            zf.write(str(script_json), "script.json")
+
+    buf.seek(0)
+    zip_name = f"task_{task_id}_package.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
 
 
 # ── Daily Publish Plan ────────────────────────────────────────

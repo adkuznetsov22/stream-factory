@@ -356,6 +356,33 @@ def step9b_download(task_id: int):
         fail(f"Download failed: {e}")
 
 
+def step9c_package(task_id: int):
+    step("9c. Download package zip")
+    url = f"{BASE_URL}/api/publish-tasks/{task_id}/package"
+    req = Request(url, headers=_headers(), method="GET")
+    try:
+        with urlopen(req, timeout=60) as resp:
+            data = resp.read()
+            ct = resp.headers.get("Content-Type", "")
+            if len(data) == 0:
+                fail("Package returned empty body")
+            ok(f"Package OK: {len(data)} bytes, Content-Type={ct}")
+            import io, zipfile
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = zf.namelist()
+                ok(f"Zip contents: {names}")
+                if "metadata.json" not in names:
+                    fail("metadata.json missing from package")
+                has_video = any(n.endswith(".mp4") for n in names)
+                if not has_video:
+                    fail("No .mp4 file in package")
+                ok("Package contains final.mp4 + metadata.json ✓")
+    except HTTPError as e:
+        fail(f"Package failed: {e.code} {e.read().decode()[:200]}")
+    except URLError as e:
+        fail(f"Package failed: {e}")
+
+
 def step10_dry_run_plan(project_id: int, task_id: int):
     step("10. Auto-publish DRY RUN (publish-plan)")
     try:
@@ -441,6 +468,9 @@ def main():
 
         # 9b. Download final video
         step9b_download(task_id)
+
+        # 9c. Download package
+        step9c_package(task_id)
 
         # 10. Dry-run plan
         step10_dry_run_plan(project_id, task_id)
