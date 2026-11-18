@@ -1,0 +1,8 @@
+streamlink==8.6.3
+faster-whisper==1.2.1
+httpx==0.28.1
+numpy==2.5.5
+pydantic-settings==2.16.3
+fastapi==0.162.7
+uvicorn==0.52.4
+scikit-learn==1.7.2

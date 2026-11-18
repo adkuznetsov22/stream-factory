@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Clipper — админка</title>
+<style>
+:root{--bg:#0f1117;--panel:#181b24;--line:#2a2f3d;--text:#e6e8ee;--muted:#8a90a2;--accent:#ff2d95;--ok:#2ecc71;--warn:#f5a623;--err:#ff5f5f}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:18px;padding:10px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header b{color:var(--accent);font-size:16px}nav{display:flex;gap:4px;flex-wrap:wrap}
+nav a{padding:6px 12px;border-radius:8px;color:var(--muted);cursor:pointer;text-decoration:none}nav a.on{background:var(--line);color:var(--text)}
+main{padding:20px;max-width:1400px;margin:0 auto}h2{margin:0 0 12px;font-size:18px}h3{margin:18px 0 8px;font-size:15px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.grid{display:grid;gap:12px}.kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}.kpi .v{font-size:22px;font-weight:700}.muted{color:var(--muted)}
+table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{color:var(--muted);font-weight:500}
+button,.btn{background:var(--line);color:var(--text);border:0;border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit}
+button.primary{background:var(--accent)}button.danger{background:#5a2330}button:disabled{opacity:.5;cursor:default}
+input,select,textarea{background:#0c0e14;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit}
+textarea{width:100%;min-height:70px}label{display:block;margin:8px 0 3px;color:var(--muted)}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:var(--line)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.err{color:var(--err)}
+.bar{height:8px;background:#0c0e14;border-radius:4px;overflow:hidden;min-width:120px}.bar i{display:block;height:100%;background:var(--accent)}
+.clips{grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}.clip img,.clip video{width:100%;aspect-ratio:9/16;object-fit:cover;border-radius:8px;background:#000;cursor:pointer}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.sp{flex:1}
+.toast{position:fixed;right:20px;bottom:20px;background:var(--panel);border:1px solid var(--line);padding:10px 14px;border-radius:10px;max-width:420px}
+.check{padding:10px;border-radius:8px;background:#0c0e14;margin-top:8px}
+#login{max-width:320px;margin:120px auto}
+.log td{font-family:ui-monospace,monospace;font-size:12px}
+.steps li{margin:4px 0}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="login" class="card" hidden>
+  <h2>Вход в админку</h2>
+  <form onsubmit="doLogin(event)"><input id="pw" type="password" placeholder="Пароль" style="width:100%" autofocus>
+  <div class="row" style="margin-top:10px"><button class="primary">Войти</button><span id="lerr" class="err"></span></div></form>
+</div>
+<div id="appui" hidden>
+<header><b>Live Clipper</b>
+  <nav id="nav"></nav><span class="sp"></span>
+  <span id="pausebox"></span>
+</header>
+<main id="view"></main>
+</div>
+<div id="toast" class="toast" hidden></div>
+<script>
+const TABS = {live:"Эфир", clips:"Клипы", targets:"Площадки", streamers:"Стримеры", settings:"Настройки", log:"Журнал"};
+const KIND = {telegram:"Telegram", vk:"VK", youtube:"YouTube"};
+const FIELD_LABEL = {bot_token:"Токен бота (@BotFather)", chat_id:"Канал (@username или -100…)", access_token:"Токен VK (video, wall, groups, offline)",
+  group_id:"ID сообщества (цифры)", client_id:"OAuth Client ID", client_secret:"OAuth Client Secret", refresh_token:"Refresh token (youtube.upload)", privacy:"Видимость: public | unlisted | private"};
+const STATUS = {detected:["в очереди",""], rendering:["собирается","warn"], ready:["готов",""], published:["опубликован","ok"], rejected:["отклонён","muted"], error:["ошибка","err"]};
+let tab = location.hash.slice(1) || "live", timer = null, targetsCache = [];
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ago = ts => { const s = Math.round(Date.now()/1000 - ts); return s < 60 ? s+" с" : s < 3600 ? Math.round(s/60)+" мин" : Math.round(s/3600)+" ч"; };
+function toast(msg, cls=""){ const t=$("#toast"); t.innerHTML=`<span class="${cls}">${esc(msg)}</span>`; t.hidden=false; clearTimeout(t._t); t._t=setTimeout(()=>t.hidden=true,4500); }
+async function api(path, opts={}){
+  const r = await fetch(path, {headers:{"Content-Type":"application/json"}, ...opts, body: opts.body!==undefined ? JSON.stringify(opts.body) : undefined});
+  if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error("unauthorized"); }
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok) { const m = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail||data); toast(m,"err"); throw new Error(m); }
+  return data;
+}
+function showLogin(){ $("#login").hidden=false; $("#appui").hidden=true; clearInterval(timer); }
+async function doLogin(e){ e.preventDefault(); try{ await api("/api/login",{method:"POST",body:{password:$("#pw").value}}); start(); }catch(err){ $("#lerr").textContent="Неверный пароль"; } }
+function start(){ $("#login").hidden=true; $("#appui").hidden=false; go(tab); }
+function go(t){
+  tab=t; location.hash=t; clearInterval(timer);
+  $("#nav").innerHTML = Object.entries(TABS).map(([k,v])=>`<a class="${k===t?"on":""}" onclick="go('${k}')">${v}</a>`).join("");
+  const r = {live:renderLive, clips:renderClips, targets:renderTargets, streamers:renderStreamers, settings:renderSettings, log:renderLog}[t];
+  r(); if (t==="live" || t==="log") timer=setInterval(r, 3000);
+  if (t==="clips") timer=setInterval(()=>document.querySelectorAll(".clip.pending").forEach(el=>refreshClip(+el.id.slice(5))), 4000);
+}
+async function pauseBox(s){
+  $("#pausebox").innerHTML = s.publish_paused
+    ? `<span class="warn">Публикация на паузе</span> <button class="primary" onclick="setPause(false)">Возобновить</button>`
+    : `<span class="ok">Автопубликация включена</span> <button onclick="setPause(true)">Пауза</button>`;
+}
+async function setPause(v){ await api("/api/settings",{method:"PUT",body:{publish_paused:v}}); toast(v?"Публикация остановлена":"Публикация возобновлена"); go(tab); }
+
+// ---- Эфир ----
+async function renderLive(){
+  const s = await api("/api/status"); pauseBox(s);
+  const steps = [];
+  if (!s.targets.some(t=>t.enabled)) steps.push(`Подключите площадку: <a href="#targets" onclick="go('targets')">Площадки</a> → добавить → «Проверить» → включить.`);
+  if (!s.channels.length) steps.push(`Сейчас никто из списка не стримит GTA 6. Проверьте <a href="#streamers" onclick="go('streamers')">Стримеры</a> или снизьте порог зрителей.`);
+  const day = s.day || {};
+  $("#view").innerHTML = `
+  ${steps.length ? `<div class="card" style="margin-bottom:12px;border-color:var(--warn)"><b>Что сделать:</b><ol class="steps">${steps.map(x=>`<li>${x}</li>`).join("")}</ol></div>` : ""}
+  <div class="grid kpis">
+    <div class="card kpi"><div class="muted">Стримов пишется</div><div class="v">${s.channels.length}</div></div>
+    <div class="card kpi"><div class="muted">Клипов за 24 ч</div><div class="v">${day.clips||0}</div></div>
+    <div class="card kpi"><div class="muted">Опубликовано за 24 ч</div><div class="v ok">${day.published||0}</div></div>
+    <div class="card kpi"><div class="muted">Собирается / в очереди</div><div class="v">${s.rendering} / ${s.queue}</div></div>
+    <div class="card kpi"><div class="muted">Ошибки за 24 ч</div><div class="v ${day.errors?"err":""}">${day.errors||0}</div></div>
+    <div class="card kpi"><div class="muted">Диск: данные / свободно</div><div class="v">${s.disk.data_gb} / ${s.disk.free_gb} ГБ</div></div>
+  </div>
+  <h3>Площадки</h3>
+  <div class="card"><table><tr><th>Площадка</th><th>Режим</th><th>Сегодня</th><th>В очереди</th><th>Ошибки 24 ч</th></tr>
+  ${s.targets.map(t=>`<tr><td>${esc(t.name)} <span class="pill">${KIND[t.kind]}</span> ${t.enabled?'<span class="ok">вкл</span>':'<span class="muted">выкл</span>'}</td>
+    <td>${t.mode==="auto"?"авто":"на одобрении"}</td><td>${t.today} / ${t.daily_limit}</td><td>${t.queued}</td><td class="${t.errors?"err":""}">${t.errors}</td></tr>`).join("") || `<tr><td colspan=5 class="muted">Площадок нет</td></tr>`}
+  </table></div>
+  <h3>В эфире сейчас</h3>
+  <div class="card"><table><tr><th>Стример</th><th>Зрители</th><th>Хайп (порог ${s.trigger_score})</th><th>Чат/мин</th><th>Буфер</th><th>Запись</th><th></th></tr>
+  ${s.channels.map(c=>`<tr><td><b>${esc(c.name)}</b> ${c.whitelisted?'<span class="pill">список</span>':''}<div class="muted">${esc(c.title).slice(0,70)}</div></td>
+    <td>${c.viewers.toLocaleString("ru")}</td>
+    <td><div class="row"><div class="bar"><i style="width:${Math.min(100,Math.max(0,c.score)/s.trigger_score*100)}%;${c.score>=s.trigger_score?"background:var(--ok)":""}"></i></div>${c.score}</div></td>
+    <td>${c.chat_per_min}</td><td>${c.buffered_s<60?c.buffered_s+" с":Math.round(c.buffered_s/60)+" мин"}</td>
+    <td>${c.recording?'<span class="ok">идёт</span>':'<span class="warn">переподключение</span>'}</td>
+    <td><div class="row"><select id="sec_${c.login}"><option>20</option><option selected>30</option><option>45</option><option>60</option></select>
+      <button class="primary" onclick="clipNow('${c.login}')">Клип сейчас</button></div></td></tr>`).join("") || `<tr><td colspan=7 class="muted">Нет активных стримов</td></tr>`}
+  </table></div>`;
+}
+async function clipNow(login){ const sec=+$("#sec_"+login).value; const r=await api(`/api/channels/${login}/clip`,{method:"POST",body:{seconds:sec}}); toast(`Клип #${r.clip_id} собирается, появится во вкладке «Клипы»`); }
+
+// ---- Клипы ----
+let clipFilter = {status:"", login:"", min_score:0};
+async function renderClips(){
+  const t = await api("/api/targets"); targetsCache = t.targets;
+  const q = new URLSearchParams({...clipFilter, limit:60});
+  const clips = await api("/api/clips?"+q);
+  $("#view").innerHTML = `<div class="row" style="margin-bottom:12px"><h2 style="margin:0">Клипы</h2><span class="sp"></span>
+    <select onchange="clipFilter.status=this.value;renderClips()"><option value="">все статусы</option>${Object.entries(STATUS).map(([k,v])=>`<option value="${k}" ${clipFilter.status===k?"selected":""}>${v[0]}</option>`).join("")}</select>
+    <input placeholder="ник стримера" value="${esc(clipFilter.login)}" onchange="clipFilter.login=this.value.trim().toLowerCase();renderClips()" style="width:140px">
+    <label style="margin:0">балл от</label><input type="number" step="0.5" value="${clipFilter.min_score}" onchange="clipFilter.min_score=+this.value;renderClips()" style="width:70px">
+    <button onclick="renderClips()">Обновить</button></div>
+    <div class="grid clips">${clips.map(clipCard).join("") || '<div class="muted">Клипов нет</div>'}</div>`;
+}
+function clipCard(c){
+  const st = STATUS[c.status] || [c.status,""], m = c.meta || {};
+  const pubs = c.publications.map(p=>{ const t=targetsCache.find(x=>x.id===p.target_id); const n=t?t.name:"#"+p.target_id;
+    return p.status==="done" ? `<a class="ok" href="${esc(p.url)}" target="_blank">${esc(n)} ✓</a>` : p.status==="error" ? `<span class="err" title="${esc(p.error)}">${esc(n)}: ошибка</span>` : `<span class="warn">${esc(n)}: ${p.status==="queued"?"в очереди":"загружается"}</span>`; }).join(" · ");
+  const delay = c.timings && c.timings.rendered != null ? `${Math.round(c.timings.rendered)} с` : "";
+  const pending = ["detected","rendering"].includes(c.status) || c.publications.some(p=>["queued","publishing"].includes(p.status));
+  return `<div class="card clip ${pending?"pending":""}" id="clip_${c.id}">
+    ${c.has_file ? `<img src="/media/${c.id}/thumb.jpg" loading="lazy" onclick="this.outerHTML='<video src=/media/${c.id}/clip.mp4 controls autoplay playsinline></video>'" onerror="this.outerHTML='<video src=/media/${c.id}/clip.mp4 controls preload=metadata playsinline></video>'">` : `<div class="muted" style="aspect-ratio:9/16;display:grid;place-items:center;background:#0c0e14;border-radius:8px">${c.status==="error"?esc(c.error||"ошибка"):c.path===null&&c.status!=="detected"&&c.status!=="rendering"?"файл удалён":"собирается…"}</div>`}
+    <div class="row" style="margin-top:8px"><b>${esc(c.login)}</b><span class="pill ${st[1]}">${st[0]}</span>${c.manual?'<span class="pill">вручную</span>':''}<span class="sp"></span><span title="балл момента">★ ${c.score}</span></div>
+    <div class="muted">#${c.id} · ${ago(c.created_at)} назад ${delay?"· готов за "+delay:""}</div>
+    ${m.title ? `<label>Заголовок</label><input id="t_${c.id}" value="${esc(m.title)}" style="width:100%">
+    <label>Описание</label><textarea id="d_${c.id}">${esc(m.description)}</textarea>
+    <div class="row" style="margin-top:6px"><button onclick="saveClip(${c.id})">Сохранить</button><button onclick="retitle(${c.id})" title="Сгенерировать заново">Новый заголовок</button></div>`:""}
+    ${pubs ? `<div style="margin-top:8px">${pubs}</div>` : ""}
+    ${c.has_file ? `<div class="row" style="margin-top:8px">${targetsCache.filter(t=>t.enabled).map(t=>`<button class="primary" onclick="pub(${c.id},[${t.id}])">→ ${esc(t.name)}</button>`).join("")}
+      ${c.status!=="rejected"?`<button class="danger" onclick="reject(${c.id})">Отклонить</button>`:""}
+      <a class="btn" href="/media/${c.id}/clip.mp4" download="clip_${c.id}.mp4">Скачать</a></div>` : ""}
+  </div>`;
+}
+async function refreshClip(id){ const [c] = await api(`/api/clips?limit=1&before=${id+1}`); if (c && c.id===id) $("#clip_"+id).outerHTML = clipCard(c); }
+async function saveClip(id){ await api(`/api/clips/${id}`,{method:"PATCH",body:{title:$("#t_"+id).value,description:$("#d_"+id).value}}); toast("Сохранено"); }
+async function retitle(id){ toast("Генерирую…"); const c=await api(`/api/clips/${id}/retitle`,{method:"POST"}); $("#clip_"+id).outerHTML = clipCard(c); }
+async function pub(id, ids){ const c=await api(`/api/clips/${id}/publish`,{method:"POST",body:{target_ids:ids}}); $("#clip_"+id).outerHTML = clipCard(c); toast("Поставлено в очередь публикации"); }
+async function reject(id){ await api(`/api/clips/${id}/reject`,{method:"POST"}); refreshClip(id); }
+
+// ---- Площадки ----
+async function renderTargets(){
+  const {fields, targets} = await api("/api/targets");
+  $("#view").innerHTML = `<div class="row" style="margin-bottom:12px"><h2 style="margin:0">Площадки</h2><span class="sp"></span>
+    ${Object.entries(KIND).map(([k,v])=>`<button onclick="addTarget('${k}')">+ ${v}</button>`).join("")}</div>
+    <p class="muted">Площадка публикует клипы, только когда она включена. «Авто» — сервис сам выкладывает лучшие свежие клипы с баллом не ниже порога, соблюдая лимит в сутки и паузу между постами. «На одобрении» — публикуются только клипы, которые вы отправили кнопкой во вкладке «Клипы».</p>
+    <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(380px,1fr))">${targets.map(t=>targetCard(t, fields[t.kind])).join("") || '<div class="muted">Добавьте первую площадку кнопкой справа сверху.</div>'}</div>`;
+}
+function targetCard(t, flds){
+  return `<div class="card" id="tg_${t.id}"><div class="row"><b>${esc(t.name)}</b><span class="pill">${KIND[t.kind]}</span><span class="sp"></span>
+    <label style="margin:0"><input type="checkbox" id="en_${t.id}" ${t.enabled?"checked":""}> включена</label></div>
+    <label>Название</label><input id="nm_${t.id}" value="${esc(t.name)}" style="width:100%">
+    ${flds.map(f=>`<label>${FIELD_LABEL[f]||f}</label><input id="cf_${t.id}_${f}" value="${esc(t.config[f]??"")}" style="width:100%" autocomplete="off">`).join("")}
+    <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px">
+      <div><label>Режим</label><select id="md_${t.id}"><option value="auto" ${t.mode==="auto"?"selected":""}>авто</option><option value="manual" ${t.mode==="manual"?"selected":""}>на одобрении</option></select></div>
+      <div><label>Лимит в сутки</label><input type="number" id="dl_${t.id}" value="${t.daily_limit}" style="width:100%"></div>
+      <div><label>Мин. балл момента</label><input type="number" step="0.5" id="ms_${t.id}" value="${t.min_score}" style="width:100%"></div>
+      <div><label>Пауза между постами, мин</label><input type="number" step="1" id="iv_${t.id}" value="${t.min_interval_min}" style="width:100%"></div>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="primary" onclick="saveTarget(${t.id})">Сохранить</button><button onclick="checkTarget(${t.id})">Проверить</button><span class="sp"></span><button class="danger" onclick="delTarget(${t.id})">Удалить</button></div>
+    <div id="ck_${t.id}"></div></div>`;
+}
+async function addTarget(kind){
+  const defaults = {telegram:{daily_limit:100,min_score:8,min_interval_min:5}, vk:{daily_limit:50,min_score:9,min_interval_min:10}, youtube:{daily_limit:6,min_score:12,min_interval_min:60}}[kind];
+  await api("/api/targets",{method:"POST",body:{kind,name:KIND[kind],mode:"auto",...defaults,config:{}}}); renderTargets();
+}
+function targetBody(id){
+  const card=$("#tg_"+id), config={};
+  card.querySelectorAll("[id^=cf_]").forEach(el=>config[el.id.split("_").slice(2).join("_")]=el.value.trim()||null);
+  return {name:$("#nm_"+id).value, enabled:$("#en_"+id).checked, mode:$("#md_"+id).value, daily_limit:+$("#dl_"+id).value,
+          min_score:+$("#ms_"+id).value, min_interval_min:+$("#iv_"+id).value, config};
+}
+async function saveTarget(id){
+  const body = targetBody(id);
+  if (body.enabled) { await api(`/api/targets/${id}`,{method:"PUT",body:{...body,enabled:false}}); const ck = await api(`/api/targets/${id}/check`,{method:"POST"});
+    if (!ck.ok) { $("#ck_"+id).innerHTML=`<div class="check err">Не включена: ${esc(ck.message)}</div>`; return; } }
+  await api(`/api/targets/${id}`,{method:"PUT",body}); toast("Сохранено"); renderTargets();
+}
+async function checkTarget(id){ await api(`/api/targets/${id}`,{method:"PUT",body:{...targetBody(id),enabled:$("#en_"+id).checked}}); $("#ck_"+id).innerHTML='<div class="check muted">Проверяю…</div>';
+  const r=await api(`/api/targets/${id}/check`,{method:"POST"}); $("#ck_"+id).innerHTML=`<div class="check ${r.ok?"ok":"err"}">${esc(r.message)}</div>`; }
+async function delTarget(id){ if(confirm("Удалить площадку?")){ await api(`/api/targets/${id}`,{method:"DELETE"}); renderTargets(); } }
+
+// ---- Стримеры ----
+async function renderStreamers(){
+  const [s, st] = await Promise.all([api("/api/settings"), api("/api/status")]);
+  const live = Object.fromEntries(st.channels.map(c=>[c.login,c]));
+  const list = (name, items, hint) => `<div class="card"><h3 style="margin-top:0">${name}</h3><p class="muted">${hint}</p>
+    <table>${items.map(l=>`<tr><td><b>${esc(l)}</b> <a class="muted" href="https://twitch.tv/${esc(l)}" target="_blank">twitch.tv/${esc(l)}</a></td>
+      <td>${live[l]?`<span class="ok">в эфире, ${live[l].viewers.toLocaleString("ru")}</span>`:'<span class="muted">не пишется</span>'}</td>
+      <td style="text-align:right"><button onclick="listRemove('${name==="Белый список"?"whitelist":"blacklist"}','${esc(l)}')">Убрать</button></td></tr>`).join("") || '<tr><td class="muted">пусто</td></tr>'}</table>
+    <div class="row" style="margin-top:8px"><input id="add_${name==="Белый список"?"whitelist":"blacklist"}" placeholder="ник на Twitch, например buster"><button class="primary" onclick="listAdd('${name==="Белый список"?"whitelist":"blacklist"}')">Добавить</button></div></div>`;
+  const others = st.channels.filter(c=>!s.whitelist.includes(c.login));
+  $("#view").innerHTML = `<h2>Стримеры</h2><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(420px,1fr))">
+    ${list("Белый список", s.whitelist, "Пишутся всегда, когда стримят GTA 6, и в первую очередь.")}
+    ${list("Чёрный список", s.blacklist, "Никогда не пишутся, даже если найдены авто-поиском.")}
+    <div class="card"><h3 style="margin-top:0">Авто-поиск</h3>
+      <label><input type="checkbox" id="auto_discover" ${s.auto_discover?"checked":""}> искать новые стримы в категории автоматически</label>
+      <label>Игра на Twitch</label><input id="game_name" value="${esc(s.game_name)}" style="width:100%">
+      <label>Язык стрима</label><input id="language" value="${esc(s.language)}">
+      <label>Минимум зрителей для авто-поиска</label><input type="number" id="min_viewers" value="${s.min_viewers}">
+      <label>Сколько стримов писать одновременно</label><input type="number" id="max_streams" value="${s.max_streams}">
+      <label><input type="checkbox" id="whitelist_any_game" ${s.whitelist_any_game?"checked":""}> писать белый список в любой игре</label>
+      <div style="margin-top:10px"><button class="primary" onclick="saveKeys(['auto_discover','game_name','language','min_viewers','max_streams','whitelist_any_game'])">Сохранить</button></div></div>
+    <div class="card"><h3 style="margin-top:0">Найдены авто-поиском</h3><table>${others.map(c=>`<tr><td><b>${esc(c.name)}</b> ${c.viewers.toLocaleString("ru")}</td>
+      <td style="text-align:right"><button onclick="listAddValue('whitelist','${c.login}')">В белый</button> <button class="danger" onclick="listAddValue('blacklist','${c.login}')">В чёрный</button></td></tr>`).join("") || '<tr><td class="muted">нет</td></tr>'}</table></div>
+  </div>`;
+}
+async function listAddValue(key, v){ const s=await api("/api/settings"); const other=key==="whitelist"?"blacklist":"whitelist";
+  await api("/api/settings",{method:"PUT",body:{[key]:[...new Set([...s[key], v])], [other]:s[other].filter(x=>x!==v)}}); toast("Сохранено, применится в течение минуты"); renderStreamers(); }
+async function listAdd(key){ const v=$("#add_"+key).value.trim().toLowerCase().replace(/^.*twitch\.tv\//,"").replace(/[^a-z0-9_]/g,""); if(v) listAddValue(key, v); }
+async function listRemove(key, v){ const s=await api("/api/settings"); await api("/api/settings",{method:"PUT",body:{[key]:s[key].filter(x=>x!==v)}}); renderStreamers(); }
+async function saveKeys(keys){ const body={}; for (const k of keys){ const el=$("#"+k); body[k] = el.type==="checkbox" ? el.checked : el.type==="number" ? +el.value : el.dataset.json!==undefined ? JSON.parse(el.value||"null") : el.value; }
+  await api("/api/settings",{method:"PUT",body}); toast("Сохранено, применяется без перезапуска"); }
+
+// ---- Настройки ----
+async function renderSettings(){
+  const s = await api("/api/settings");
+  const num = (k, label, step=1) => `<label>${label}</label><input type="number" step="${step}" id="${k}" value="${s[k]}">`;
+  $("#view").innerHTML = `<h2>Настройки</h2><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(360px,1fr))">
+   <div class="card"><h3 style="margin-top:0">Поиск моментов</h3>
+     ${num("trigger_score","Порог хайпа: ниже — больше клипов, выше — только самые яркие",0.5)}
+     ${num("cooldown","Пауза между клипами одного стримера, с")}
+     ${num("warmup_seconds","Разогрев после старта записи, с (сбор базовой активности чата)")}
+     ${num("reaction_delay","Задержка реакции чата, с",0.5)}
+     ${num("clip_before","Секунд до момента",1)}${num("clip_after","Секунд после момента",1)}</div>
+   <div class="card"><h3 style="margin-top:0">Ролик</h3>
+     <label><input type="checkbox" id="subtitles" ${s.subtitles?"checked":""}> субтитры по речи стримера</label>
+     <label>Раскладка</label><select id="layout"><option value="blur" ${s.layout==="blur"?"selected":""}>геймплей по центру + размытый фон</option><option value="facecam" ${s.layout==="facecam"?"selected":""}>вебка сверху + геймплей снизу</option></select>
+     <label>Позиции вебки (JSON: ник → [x, y, ширина, высота] в долях кадра)</label><textarea id="facecam" data-json>${esc(JSON.stringify(s.facecam))}</textarea>
+     <label>Хэштеги (JSON-список)</label><input id="hashtags" data-json value="${esc(JSON.stringify(s.hashtags))}" style="width:100%"></div>
+   <div class="card"><h3 style="margin-top:0">Заголовки (LLM)</h3>
+     <p class="muted">Без ключа заголовки собираются по шаблону из речи стримера.</p>
+     <label>Ключ OpenRouter</label><input id="openrouter_api_key" value="${esc(s.openrouter_api_key??"")}" style="width:100%" autocomplete="off">
+     <label>Модель</label><input id="openrouter_model" value="${esc(s.openrouter_model)}" style="width:100%"></div>
+   <div class="card"><h3 style="margin-top:0">Публикация и хранение</h3>
+     ${num("max_publish_age_min","Публиковать авто-режимом только клипы не старше, мин")}
+     ${num("retention_hours","Хранить неопубликованные клипы, ч",1)}
+     ${num("retention_published_hours","Хранить опубликованные клипы, ч",1)}</div>
+  </div><div style="margin-top:12px"><button class="primary" onclick="saveKeys(['trigger_score','cooldown','warmup_seconds','reaction_delay','clip_before','clip_after','subtitles','layout','facecam','hashtags','openrouter_api_key','openrouter_model','max_publish_age_min','retention_hours','retention_published_hours'])">Сохранить настройки</button></div>`;
+}
+
+// ---- Журнал ----
+let logLevel = "INFO";
+async function renderLog(){
+  const rows = await api("/api/log?level="+logLevel);
+  $("#view").innerHTML = `<div class="row" style="margin-bottom:12px"><h2 style="margin:0">Журнал</h2><span class="sp"></span>
+    <select onchange="logLevel=this.value;renderLog()">${["INFO","WARNING","ERROR"].map(l=>`<option ${l===logLevel?"selected":""}>${l}</option>`).join("")}</select></div>
+    <div class="card log"><table>${rows.map(r=>`<tr><td class="muted" style="white-space:nowrap">${new Date(r.ts*1000).toLocaleTimeString("ru")}</td>
+    <td class="${r.level==="ERROR"?"err":r.level==="WARNING"?"warn":""}">${esc(r.msg)}</td></tr>`).join("") || '<tr><td class="muted">пусто</td></tr>'}</table></div>`;
+}
+api("/api/status").then(start).catch(()=>{});
+</script>
+</body>
+</html>
