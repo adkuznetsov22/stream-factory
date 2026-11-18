@@ -44,7 +44,7 @@ class Recorder:
     def latest_wall(self) -> float:
         return self.segments[-1].wall_end if self.segments else 0.0
 
-    def range(self, t0: float, t1: float) -> list[Segment]:
+    def range(self, t0: float, t1: float, core: tuple[float, float] | None = None) -> list[Segment]:
         """Segments overlapping [t0, t1], limited to the last gap-free run so media time matches wall time."""
         segs = [seg for seg in self.segments if seg.wall_end > t0 and seg.wall_start < t1]
         runs, cur = [], []
@@ -55,7 +55,8 @@ class Recorder:
             cur.append(seg)
         if cur:
             runs.append(cur)
-        overlap = lambda r: sum(min(s.wall_end, t1) - max(s.wall_start, t0) for s in r)
+        c0, c1 = core or (t0, t1)
+        overlap = lambda r: sum(max(min(s.wall_end, c1) - max(s.wall_start, c0), 0) for s in r)
         return max(runs, key=overlap) if runs else []
 
     async def run(self):

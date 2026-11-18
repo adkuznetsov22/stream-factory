@@ -280,18 +280,19 @@ class App:
         deadline = time.time() + 90
         while ch.recorder.latest_wall < m.end + 1 and time.time() < deadline:
             await asyncio.sleep(0.5)
-        segments = ch.recorder.range(m.start - pad, m.end + 1)
+        segments = ch.recorder.range(m.start - pad, m.end + 1, core=(m.start, m.end))
         if not segments:
             raise RuntimeError("нет сегментов в буфере")
         clip_dir = self.s.clips_dir / f"{m.login}_{int(m.start)}"
         t = {"detected": detected_at, "buffered": time.time()}
         src, src_wall, src_dur = await cut_source(segments, clip_dir)
         trim = (max(m.start - src_wall, 0.0), min(m.end - src_wall, src_dur))
+        speech_checked = True
         try:
             lines = await self.transcriber.lines(src, *trim)
         except Exception:
             log.warning("[%s] речь не распознана (нет звука?)", m.login)
-            lines = []
+            lines, speech_checked = [], False
         transcript = " ".join(ln["text"] for ln in lines)
         t["transcribed"] = time.time()
         st = ch.stream
@@ -302,6 +303,8 @@ class App:
                 if src_wall <= sec <= src_wall + src_dur]
         titles = [r["title"] for r in self.store.rows("SELECT title FROM viewer_clips WHERE clip_id = ?", clip_id)]
         safety = heuristic_safety(transcript, m.chat, titles)
+        if not speech_checked:
+            safety["categories"]["unchecked"] = {"level": 2, "evidence": "речь не распознана, мат не проверен"}
         verdict = await safe_judge(self.http, self.s, src, trim[0], trim[1], st.display_name, st.title, lines, m.chat, titles)
         t["judged"] = time.time()
         if verdict:
@@ -348,7 +351,9 @@ class App:
         e = c["edit"]
         lo, hi = e.get("subs_range") or [0, 0]
         if (e["trim_start"] < lo - 0.5 or e["trim_end"] > hi + 0.5):
-            lines = await self.transcriber.lines(Path(c["src_path"]), e["trim_start"], e["trim_end"])
+            fresh = await self.transcriber.lines(Path(c["src_path"]), e["trim_start"], e["trim_end"])
+            kept = [ln for ln in c["subs"] or [] if ln["end"] > lo and ln["start"] < hi]
+            lines = sorted(kept + [ln for ln in fresh if ln["end"] <= lo or ln["start"] >= hi], key=lambda x: x["start"])
             e["subs_range"] = [e["trim_start"], e["trim_end"]]
             self.store.update(clip_id, subs=lines, edit=e)
             c = self.store.clip(clip_id)
