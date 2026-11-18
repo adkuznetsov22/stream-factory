@@ -74,6 +74,8 @@ def status(app: "App") -> dict:
 
 def create_api(app: "App") -> FastAPI:
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    store = app.store
+
     def make_token() -> str:
         nonce = store.get_settings().get("_session_nonce")
         if not nonce:
