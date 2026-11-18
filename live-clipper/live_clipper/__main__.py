@@ -1,9 +1,15 @@
 import argparse
 import asyncio
 import logging
+import os
+import sys
+from pathlib import Path
 
 from .app import App
 from .config import settings
+
+# streamlink is installed next to the interpreter; make it reachable without activating the venv
+os.environ["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
 def main():
