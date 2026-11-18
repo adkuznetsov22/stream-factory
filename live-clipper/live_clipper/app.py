@@ -361,7 +361,7 @@ class App:
             else:
                 speech_unchecked = False
                 e["subs_range"] = [e["trim_start"], e["trim_end"]]
-                self.store.update(clip_id, subs=fresh, edit=e, transcript=" ".join(ln["text"] for ln in fresh))
+                self.store.update(clip_id, subs=fresh, edit=e)
                 c = self.store.clip(clip_id)
         src = Path(c["src_path"])
         cur = c.get("judge") or {}
@@ -393,7 +393,7 @@ class App:
             "SELECT 1 FROM publications WHERE clip_id = ? AND status = 'done'", clip_id) else "ready"
         if c["status"] == "rejected":
             status = "rejected"
-        self.store.update(clip_id, status=status, path=str(video), version=(c["version"] or 1) + 1,
+        self.store.update(clip_id, status=status, path=str(video), transcript=transcript, version=(c["version"] or 1) + 1,
                           updated_at=time.time(), error=None)
         log.info("клип #%d перерендерен", clip_id)
 
