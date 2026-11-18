@@ -361,7 +361,7 @@ class App:
             else:
                 speech_unchecked = False
                 e["subs_range"] = [e["trim_start"], e["trim_end"]]
-                self.store.update(clip_id, subs=fresh, edit=e)
+                self.store.update(clip_id, subs=fresh, edit=e, transcript=" ".join(ln["text"] for ln in fresh))
                 c = self.store.clip(clip_id)
         src = Path(c["src_path"])
         cur = c.get("judge") or {}
@@ -377,7 +377,7 @@ class App:
             e["blur"] = verdict.get("banners") or []
         if speech_unchecked:
             safety["categories"]["unchecked"] = {"level": 2, "evidence": "речь не распознана, мат не проверен"}
-        elif not verdict and prev_unchecked:
+        elif not verdict and prev_unchecked and not prev_unchecked.get("evidence", "").startswith("речь"):
             safety["categories"]["unchecked"] = prev_unchecked
         elif not verdict and (cur or self.s.openrouter_api_key or self.s.openai_api_key):
             safety["categories"]["unchecked"] = {"level": 2, "evidence": "после монтажа ИИ-проверка не выполнена"}
