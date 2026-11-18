@@ -136,7 +136,7 @@ def _blur_prefix(fps: int, boxes: list[list[float]]) -> str:
         return f"[0:v]fps={fps},"
     out = f"[0:v]fps={fps}[s0];"
     for i, (x, y, w, h) in enumerate(boxes):
-        out += (f"[s{i}]split=2[m{i}][c{i}];[c{i}]crop=iw*{w:.4f}:ih*{h:.4f}:iw*{x:.4f}:ih*{y:.4f},boxblur=25:4[b{i}];"
+        out += (f"[s{i}]split=2[m{i}][c{i}];[c{i}]crop=iw*{w:.4f}:ih*{h:.4f}:iw*{x:.4f}:ih*{y:.4f},boxblur=lr='min(20,min(w,h)/4)':lp=3:cr='min(10,min(cw,ch)/4)':cp=3[b{i}];"
                 f"[m{i}][b{i}]overlay=main_w*{x:.4f}:main_h*{y:.4f}[s{i + 1}];")
     return out + f"[s{len(boxes)}]"
 
@@ -166,9 +166,9 @@ def _video_filter(s: Settings, spec: RenderSpec, clip_dir: Path) -> tuple[str, i
         title_y, sub_margin = max((H - gh) // 2 - 330, 60), (H - gh) // 2 + gh + 40
     font = s.font_file
     filters = []
-    if spec.overlay.strip():
-        text = re.sub(r"[^\w\s.,!?…:;«»\"'()+%№-]", "", spec.overlay).strip()
-        lines = textwrap.wrap(text.upper(), 18, break_long_words=False)[:3] or [""]
+    text = re.sub(r"[^\w\s.,!?…:;«»\"'()+%№-]", "", spec.overlay).strip()
+    if text:
+        lines = textwrap.wrap(text.upper(), 18, break_long_words=False)[:3]
         (clip_dir / "title.txt").write_text("\n".join(lines), encoding="utf-8")
         size = min(68, int(960 / (0.66 * max(len(x) for x in lines))))
         filters.append(f"drawtext=fontfile={font}:textfile=title.txt:fontsize={size}:fontcolor=white:line_spacing=12:"

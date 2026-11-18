@@ -38,7 +38,13 @@ class Recorder:
         return self.segments[-1].wall_end if self.segments else 0.0
 
     def range(self, t0: float, t1: float) -> list[Segment]:
-        return [seg for seg in self.segments if seg.wall_end > t0 and seg.wall_start < t1]
+        """Segments overlapping [t0, t1], limited to the last gap-free run so media time matches wall time."""
+        segs = [seg for seg in self.segments if seg.wall_end > t0 and seg.wall_start < t1]
+        start = 0
+        for i in range(1, len(segs)):
+            if segs[i].wall_start - segs[i - 1].wall_end > 1.0:
+                start = i
+        return segs[start:]
 
     async def run(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -53,6 +59,7 @@ class Recorder:
 
     async def stop(self):
         self._active = False
+        asyncio.get_running_loop().call_later(300, shutil.rmtree, self.dir, True)
         for p in self._procs:
             if p.returncode is None:
                 p.kill()

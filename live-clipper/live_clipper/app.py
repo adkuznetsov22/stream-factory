@@ -247,7 +247,8 @@ class App:
         while True:
             kind, clip_id, m, queued_at = await self.queue.get()
             self.rendering.add(clip_id)
-            self.store.update(clip_id, status="rendering")
+            if (self.store.clip(clip_id) or {}).get("status") != "rejected":
+                self.store.update(clip_id, status="rendering")
             try:
                 if kind == "new":
                     await self.process(clip_id, m, queued_at)
@@ -286,7 +287,7 @@ class App:
         t = {"detected": detected_at, "buffered": time.time()}
         src, src_wall, src_dur = await cut_source(segments, clip_dir)
         trim = (max(m.start - src_wall, 0.0), min(m.end - src_wall, src_dur))
-        lines = await self.transcriber.lines(src, *trim) if self.s.subtitles else []
+        lines = await self.transcriber.lines(src, *trim)
         transcript = " ".join(ln["text"] for ln in lines)
         t["transcribed"] = time.time()
         st = ch.stream
@@ -321,7 +322,8 @@ class App:
         timings = {k: round(v - m.end, 1) for k, v in t.items()}
         timings["ready"] = round(time.time() - m.end, 1)
         reasons = {**(self.store.clip(clip_id)["reasons"] or {}), "hype": hype}
-        self.store.update(clip_id, status="ready", title=meta["title"], meta=meta, transcript=transcript,
+        rejected = self.store.clip(clip_id)["status"] == "rejected"
+        self.store.update(clip_id, status="rejected" if rejected else "ready", title=meta["title"], meta=meta, transcript=transcript,
                           path=str(video), timings=timings, reasons=reasons, updated_at=time.time())
         log.info("клип #%d %s готов через %.0f с после момента", clip_id, m.login, timings["ready"])
         asyncio.create_task(self._source_preview(clip_dir))
@@ -346,10 +348,33 @@ class App:
             e["subs_range"] = [e["trim_start"], e["trim_end"]]
             self.store.update(clip_id, subs=lines, edit=e)
             c = self.store.clip(clip_id)
-        await render_clip(self.s, Path(c["src_path"]).parent, self.spec(c))
+        src = Path(c["src_path"])
+        cur = c.get("judge") or {}
+        lines = [ln for ln in c["subs"] or [] if e["trim_start"] - 1 <= ln["start"] <= e["trim_end"]]
+        transcript = " ".join(ln["text"] for ln in lines)
+        reasons = c["reasons"] or {}
+        titles = [r["title"] for r in self.store.rows("SELECT title FROM viewer_clips WHERE clip_id = ?", clip_id)]
+        safety = heuristic_safety(transcript, reasons.get("chat_sample", []), titles)
+        verdict = await safe_judge(self.http, self.s, src, e["trim_start"], e["trim_end"], c["login"],
+                                   c.get("stream_title") or "", lines, reasons.get("chat_sample", []), titles)
+        if verdict:
+            safety = merge_safety(safety, verdict)
+            e["blur"] = verdict.get("banners") or []
+        elif cur:
+            safety["categories"]["unchecked"] = {"level": 2, "evidence": "после монтажа ИИ-проверка не выполнена"}
+        e["mute"] = [[ln["start"] - 0.15, ln["end"] + 0.15] for ln in lines if PROFANITY.search(ln["text"])]
+        self.store.update(clip_id, edit=e, safety=safety, judge=verdict)
+        c = self.store.clip(clip_id)
+        video = await render_clip(self.s, src.parent, self.spec(c))
+        if e.get("blur"):
+            safety["blur_check"] = await safe_verify_clean(self.http, self.s, video)
+            self.store.update(clip_id, safety=safety)
         status = "published" if self.store.row(
             "SELECT 1 FROM publications WHERE clip_id = ? AND status = 'done'", clip_id) else "ready"
-        self.store.update(clip_id, status=status, version=(c["version"] or 1) + 1, updated_at=time.time(), error=None)
+        if c["status"] == "rejected":
+            status = "rejected"
+        self.store.update(clip_id, status=status, path=str(video), version=(c["version"] or 1) + 1,
+                          updated_at=time.time(), error=None)
         log.info("клип #%d перерендерен", clip_id)
 
     # ---- housekeeping ----------------------------------------------------------
@@ -393,6 +418,14 @@ class App:
         from .admin import create_api
 
         self.s.data_dir.mkdir(parents=True, exist_ok=True)
+        stuck = self.store.rows("SELECT id FROM clips WHERE status IN ('detected', 'rendering')")
+        for r in stuck:
+            self.store.update(r["id"], status="error", error="прервано перезапуском сервиса")
+        if stuck:
+            log.info("перезапуск: %d незавершённых клипов помечены ошибкой", len(stuck))
+        if self.s.buffer_dir.exists():
+            for d in self.s.buffer_dir.iterdir():
+                shutil.rmtree(d, ignore_errors=True)
         server = uvicorn.Server(uvicorn.Config(create_api(self), host=self.s.admin_host, port=self.s.admin_port,
                                                log_level="warning", lifespan="off"))
         log.info("админка: http://%s:%d", self.s.admin_host, self.s.admin_port)

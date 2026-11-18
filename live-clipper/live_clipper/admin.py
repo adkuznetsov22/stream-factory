@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import secrets
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -73,28 +74,39 @@ def status(app: "App") -> dict:
 
 def create_api(app: "App") -> FastAPI:
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    token = hmac.new(app.admin_password.encode(), b"live-clipper-admin", hashlib.sha256).hexdigest()
+    def make_token() -> str:
+        nonce = store.get_settings().get("_session_nonce")
+        if not nonce:
+            nonce = secrets.token_hex(16)
+            store.set_settings({"_session_nonce": nonce})
+        return hmac.new(app.admin_password.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+
+    api.state.token = make_token()
     store = app.store
 
     @api.middleware("http")
     async def auth(request: Request, call_next):
         path = request.url.path
         if (path.startswith("/api/") or path.startswith("/media/")) and path != "/api/login":
+            token = api.state.token
             if not hmac.compare_digest(request.cookies.get(COOKIE, ""), token):
                 return JSONResponse({"detail": "unauthorized"}, status_code=401)
         return await call_next(request)
 
     @api.post("/api/login")
-    async def login(password: str = Body(embed=True)):
+    async def login(request: Request, password: str = Body(embed=True)):
         if not hmac.compare_digest(password, app.admin_password):
             await asyncio.sleep(1)
             raise HTTPException(401, "неверный пароль")
         resp = JSONResponse({"ok": True})
-        resp.set_cookie(COOKIE, token, max_age=30 * 86400, httponly=True, samesite="lax")
+        resp.set_cookie(COOKIE, api.state.token, max_age=30 * 86400, httponly=True, samesite="lax",
+                        secure=request.headers.get("x-forwarded-proto", request.url.scheme) == "https")
         return resp
 
     @api.post("/api/logout")
     async def logout():
+        store.set_settings({"_session_nonce": secrets.token_hex(16)})
+        api.state.token = make_token()
         resp = JSONResponse({"ok": True})
         resp.delete_cookie(COOKIE)
         return resp

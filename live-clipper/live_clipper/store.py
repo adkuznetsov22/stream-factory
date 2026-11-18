@@ -131,6 +131,7 @@ class Store:
         self._update("targets", target_id, fields)
 
     def delete_target(self, target_id: int):
+        self.db.execute("DELETE FROM publications WHERE target_id = ? AND status != 'done'", (target_id,))
         self.db.execute("DELETE FROM targets WHERE id = ?", (target_id,))
         self.db.commit()
 

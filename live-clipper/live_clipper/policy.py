@@ -13,6 +13,7 @@ CATEGORIES = {
     "violence_real": "реальное насилие (не игровое)",
     "personal_data": "личные данные на экране",
     "music": "чужая музыка (риск Content ID)",
+    "unchecked": "не проверено ИИ",
 }
 THEMES = {"funny": "смешно", "fail": "фейл", "epic": "эпик, скилл", "drama": "конфликт, драма",
           "reaction": "реакция стримера", "wholesome": "мило, душевно", "scary": "испуг, скример"}
