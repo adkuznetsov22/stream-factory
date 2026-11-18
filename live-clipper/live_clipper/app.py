@@ -350,14 +350,19 @@ class App:
             raise RuntimeError("исходник уже удалён, менять можно только текст")
         e = c["edit"]
         lo, hi = e.get("subs_range") or [0, 0]
-        if (e["trim_start"] < lo - 0.5 or e["trim_end"] > hi + 0.5):
-            fresh = await self.transcriber.lines(Path(c["src_path"]), e["trim_start"], e["trim_end"])
-            inside = lambda ln: lo <= (ln["start"] + ln["end"]) / 2 <= hi
-            kept = [ln for ln in c["subs"] or [] if inside(ln)]
-            lines = sorted(kept + [ln for ln in fresh if not inside(ln)], key=lambda x: x["start"])
-            e["subs_range"] = [e["trim_start"], e["trim_end"]]
-            self.store.update(clip_id, subs=lines, edit=e)
-            c = self.store.clip(clip_id)
+        prev_unchecked = ((c.get("safety") or {}).get("categories") or {}).get("unchecked")
+        speech_unchecked = bool(prev_unchecked and prev_unchecked.get("evidence", "").startswith("речь"))
+        if speech_unchecked or e["trim_start"] < lo - 0.5 or e["trim_end"] > hi + 0.5:
+            try:
+                fresh = await self.transcriber.lines(Path(c["src_path"]), e["trim_start"], e["trim_end"])
+            except Exception:
+                log.warning("клип #%d: речь не распознана при пересборке", clip_id)
+                speech_unchecked = True
+            else:
+                speech_unchecked = False
+                e["subs_range"] = [e["trim_start"], e["trim_end"]]
+                self.store.update(clip_id, subs=fresh, edit=e)
+                c = self.store.clip(clip_id)
         src = Path(c["src_path"])
         cur = c.get("judge") or {}
         lines = [ln for ln in c["subs"] or [] if e["trim_start"] - 1 <= ln["start"] <= e["trim_end"]]
@@ -370,8 +375,9 @@ class App:
         if verdict:
             safety = merge_safety(safety, verdict)
             e["blur"] = verdict.get("banners") or []
-        prev_unchecked = ((c.get("safety") or {}).get("categories") or {}).get("unchecked")
-        if not verdict and prev_unchecked:
+        if speech_unchecked:
+            safety["categories"]["unchecked"] = {"level": 2, "evidence": "речь не распознана, мат не проверен"}
+        elif not verdict and prev_unchecked:
             safety["categories"]["unchecked"] = prev_unchecked
         elif not verdict and (cur or self.s.openrouter_api_key or self.s.openai_api_key):
             safety["categories"]["unchecked"] = {"level": 2, "evidence": "после монтажа ИИ-проверка не выполнена"}
