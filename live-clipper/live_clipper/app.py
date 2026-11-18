@@ -352,10 +352,9 @@ class App:
         lo, hi = e.get("subs_range") or [0, 0]
         if (e["trim_start"] < lo - 0.5 or e["trim_end"] > hi + 0.5):
             fresh = await self.transcriber.lines(Path(c["src_path"]), e["trim_start"], e["trim_end"])
-            new = [ln for ln in fresh if ln["start"] < lo or ln["end"] > hi]
-            kept = [ln for ln in c["subs"] or [] if lo <= ln["start"] and ln["end"] <= hi
-                    and not any(n["start"] < ln["end"] and ln["start"] < n["end"] for n in new)]
-            lines = sorted(kept + new, key=lambda x: x["start"])
+            inside = lambda ln: lo <= (ln["start"] + ln["end"]) / 2 <= hi
+            kept = [ln for ln in c["subs"] or [] if inside(ln)]
+            lines = sorted(kept + [ln for ln in fresh if not inside(ln)], key=lambda x: x["start"])
             e["subs_range"] = [e["trim_start"], e["trim_end"]]
             self.store.update(clip_id, subs=lines, edit=e)
             c = self.store.clip(clip_id)
@@ -374,7 +373,7 @@ class App:
         prev_unchecked = ((c.get("safety") or {}).get("categories") or {}).get("unchecked")
         if not verdict and prev_unchecked:
             safety["categories"]["unchecked"] = prev_unchecked
-        elif cur or self.s.openrouter_api_key or self.s.openai_api_key:
+        elif not verdict and (cur or self.s.openrouter_api_key or self.s.openai_api_key):
             safety["categories"]["unchecked"] = {"level": 2, "evidence": "после монтажа ИИ-проверка не выполнена"}
         e["mute"] = sorted({tuple(x) for x in (e.get("mute") or [])} | {
             (ln["start"] - 0.15, ln["end"] + 0.15) for ln in lines if PROFANITY.search(ln["text"])})
