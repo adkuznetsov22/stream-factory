@@ -20,6 +20,13 @@ class Segment:
     wall_end: float
 
 
+def _drop_if_idle(path, idle: float = 240):
+    """Remove a stopped channel's buffer unless a resumed recorder is writing there again."""
+    files = list(path.glob("*")) if path.exists() else []
+    if not files or time.time() - max(f.stat().st_mtime for f in files) > idle:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 class Recorder:
     """streamlink | ffmpeg -f segment into a rolling on-disk buffer with wall-clock timestamps."""
 
@@ -40,11 +47,16 @@ class Recorder:
     def range(self, t0: float, t1: float) -> list[Segment]:
         """Segments overlapping [t0, t1], limited to the last gap-free run so media time matches wall time."""
         segs = [seg for seg in self.segments if seg.wall_end > t0 and seg.wall_start < t1]
-        start = 0
-        for i in range(1, len(segs)):
-            if segs[i].wall_start - segs[i - 1].wall_end > 1.0:
-                start = i
-        return segs[start:]
+        runs, cur = [], []
+        for seg in segs:
+            if cur and seg.wall_start - cur[-1].wall_end > 1.0:
+                runs.append(cur)
+                cur = []
+            cur.append(seg)
+        if cur:
+            runs.append(cur)
+        overlap = lambda r: sum(min(s.wall_end, t1) - max(s.wall_start, t0) for s in r)
+        return max(runs, key=overlap) if runs else []
 
     async def run(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -59,7 +71,7 @@ class Recorder:
 
     async def stop(self):
         self._active = False
-        asyncio.get_running_loop().call_later(300, shutil.rmtree, self.dir, True)
+        asyncio.get_running_loop().call_later(300, _drop_if_idle, self.dir)
         for p in self._procs:
             if p.returncode is None:
                 p.kill()

@@ -120,7 +120,7 @@ def create_api(app: "App") -> FastAPI:
     @api.get("/api/events")
     async def events(request: Request):
         async def gen():
-            while not await request.is_disconnected():
+            while not await request.is_disconnected() and hmac.compare_digest(request.cookies.get(COOKIE, ""), api.state.token):
                 yield f"data: {json.dumps(status(app), ensure_ascii=False)}\n\n"
                 await asyncio.sleep(2)
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})

@@ -287,7 +287,11 @@ class App:
         t = {"detected": detected_at, "buffered": time.time()}
         src, src_wall, src_dur = await cut_source(segments, clip_dir)
         trim = (max(m.start - src_wall, 0.0), min(m.end - src_wall, src_dur))
-        lines = await self.transcriber.lines(src, *trim)
+        try:
+            lines = await self.transcriber.lines(src, *trim)
+        except Exception:
+            log.warning("[%s] речь не распознана (нет звука?)", m.login)
+            lines = []
         transcript = " ".join(ln["text"] for ln in lines)
         t["transcribed"] = time.time()
         st = ch.stream
@@ -343,7 +347,7 @@ class App:
             raise RuntimeError("исходник уже удалён, менять можно только текст")
         e = c["edit"]
         lo, hi = e.get("subs_range") or [0, 0]
-        if e.get("subtitles") and (e["trim_start"] < lo - 0.5 or e["trim_end"] > hi + 0.5):
+        if (e["trim_start"] < lo - 0.5 or e["trim_end"] > hi + 0.5):
             lines = await self.transcriber.lines(Path(c["src_path"]), e["trim_start"], e["trim_end"])
             e["subs_range"] = [e["trim_start"], e["trim_end"]]
             self.store.update(clip_id, subs=lines, edit=e)
@@ -360,10 +364,11 @@ class App:
         if verdict:
             safety = merge_safety(safety, verdict)
             e["blur"] = verdict.get("banners") or []
-        elif cur:
+        elif cur or self.s.openrouter_api_key or self.s.openai_api_key:
             safety["categories"]["unchecked"] = {"level": 2, "evidence": "после монтажа ИИ-проверка не выполнена"}
-        e["mute"] = [[ln["start"] - 0.15, ln["end"] + 0.15] for ln in lines if PROFANITY.search(ln["text"])]
-        self.store.update(clip_id, edit=e, safety=safety, judge=verdict)
+        e["mute"] = sorted({tuple(x) for x in (e.get("mute") or [])} | {
+            (ln["start"] - 0.15, ln["end"] + 0.15) for ln in lines if PROFANITY.search(ln["text"])})
+        self.store.update(clip_id, edit=e, safety=safety, judge=verdict or cur or None)
         c = self.store.clip(clip_id)
         video = await render_clip(self.s, src.parent, self.spec(c))
         if e.get("blur"):
